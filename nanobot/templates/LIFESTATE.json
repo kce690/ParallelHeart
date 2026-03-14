@@ -1,7 +1,19 @@
 {
-  "location": "home",
-  "activity": "resting",
-  "mood": "calm",
+  "location": "家",
+  "activity": "休息",
+  "mood": "平静",
   "energy": 72,
-  "last_update": null
+  "social_battery": 66,
+  "urgency_bias": 35,
+  "busy_level": 40,
+  "reply_delay_s": 8,
+  "verbosity": 0.6,
+  "last_tick": null,
+  "next_transition_at": null,
+  "last_update": null,
+  "override_until": null,
+  "override_reason": null,
+  "override_activity": null,
+  "override_location": null,
+  "override_busy_level": null
 }

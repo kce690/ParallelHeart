@@ -169,6 +169,10 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             activity = self._as_text(life_state.get("activity"))
             mood = self._as_text(life_state.get("mood"))
             energy = self._as_number(life_state.get("energy"))
+            social_battery = self._as_number(life_state.get("social_battery"))
+            urgency_bias = self._as_number(life_state.get("urgency_bias"))
+            busy_level = self._as_number(life_state.get("busy_level"))
+            next_transition_at = self._as_text(life_state.get("next_transition_at"))
 
             state_pairs: list[str] = []
             if location:
@@ -179,28 +183,45 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
                 state_pairs.append(f"mood={mood}")
             if energy is not None:
                 state_pairs.append(f"energy={energy}")
+            if social_battery is not None:
+                state_pairs.append(f"social_battery={social_battery}")
+            if urgency_bias is not None:
+                state_pairs.append(f"urgency_bias={urgency_bias}")
+            if busy_level is not None:
+                state_pairs.append(f"busy_level={busy_level}")
             if state_pairs:
                 lines.append(f"- Hidden state cues: {'; '.join(state_pairs)}.")
 
-            last_update = self._as_text(life_state.get("last_update"))
-            if last_update:
-                lines.append(f"- Last update: {last_update}")
-
-            recent_event = self._load_recent_life_event()
-            if recent_event:
-                lines.append(f"- Grounded recent event (from LIFELOG): {recent_event}")
-            else:
-                lines.append("- Grounded recent event (from LIFELOG): none")
+            lines.append(
+                "- Treat these as real-time life cues for natural self-status replies (where you are / what you are doing / whether you are free)."
+            )
+            if next_transition_at:
+                lines.append(f"- Next state transition is expected around: {next_transition_at}")
 
             lines.extend(
                 [
                     "- Treat these as internal cues. Do not quote raw fields or numbers unless explicitly asked.",
                     "- For questions like what you are doing / where you are / whether you are free, answer from these cues in short spoken wording.",
-                    "- If grounded recent event is none, do not claim you just finished a specific task.",
+                    "- If recent grounded events are absent, do not claim you just finished a specific task.",
                 ]
             )
             if lines:
                 sections.append("# Current Life State\n\n" + "\n".join(lines))
+
+        recent_events = self._load_recent_life_events(limit=3)
+        if recent_events:
+            event_lines = [f"- {item}" for item in recent_events]
+            event_lines.extend(
+                [
+                    "- Use only these grounded events as optional detail anchors.",
+                    "- Do not invent extra life details beyond these events and current state cues.",
+                ]
+            )
+            sections.append("# Recent Life Events\n\n" + "\n".join(event_lines))
+        else:
+            sections.append(
+                "# Recent Life Events\n\n- none\n- Do not invent recent actions when no grounded event is available."
+            )
 
         relationship = self._load_json_file(self.workspace / "RELATIONSHIP.json")
         if relationship:
@@ -271,14 +292,20 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
     def _load_recent_life_event(self) -> str | None:
         """Load the most recent grounded life event from LIFELOG.md."""
+        events = self._load_recent_life_events(limit=1)
+        return events[0] if events else None
+
+    def _load_recent_life_events(self, limit: int = 3) -> list[str]:
+        """Load recent grounded life events from LIFELOG.md."""
         path = self.workspace / "LIFELOG.md"
         if not path.exists():
-            return None
+            return []
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
         except Exception:
-            return None
+            return []
 
+        events: list[str] = []
         for raw in reversed(lines):
             line = raw.strip()
             if not line:
@@ -291,13 +318,17 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
                 line = line[2:].strip()
             elif line.startswith("* "):
                 line = line[2:].strip()
+            if line.startswith("[") and "]" in line:
+                line = line.split("]", 1)[1].strip()
             if line:
-                return line
-        return None
+                events.append(line)
+            if len(events) >= max(1, limit):
+                break
+        return events
 
     def has_recent_life_event(self) -> bool:
         """Whether LIFELOG has a grounded recent event."""
-        return self._load_recent_life_event() is not None
+        return bool(self._load_recent_life_events(limit=1))
 
     def get_life_state_cues(self) -> dict[str, str]:
         """Return lightweight life-state cues for response guardrails."""

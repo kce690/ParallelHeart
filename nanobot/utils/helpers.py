@@ -252,6 +252,49 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
         updated.append(filename)
 
+    def _upgrade_lifestate_schema(filename: str) -> None:
+        """Fill missing second-cut life-state fields while preserving user values."""
+        dest = workspace / filename
+        if not dest.exists():
+            return
+        try:
+            raw = dest.read_text(encoding="utf-8").strip()
+            payload = json.loads(raw) if raw else {}
+            if not isinstance(payload, dict):
+                return
+        except Exception:
+            return
+
+        now_iso = datetime.now().astimezone().replace(microsecond=0).isoformat()
+        defaults = {
+            "location": "家",
+            "activity": "休息",
+            "mood": "平静",
+            "energy": 72,
+            "social_battery": 66,
+            "urgency_bias": 35,
+            "busy_level": 40,
+            "reply_delay_s": 8,
+            "verbosity": 0.6,
+            "last_tick": now_iso,
+            "next_transition_at": now_iso,
+            "last_update": now_iso,
+            "override_until": None,
+            "override_reason": None,
+            "override_activity": None,
+            "override_location": None,
+            "override_busy_level": None,
+        }
+        changed = False
+        for key, default in defaults.items():
+            if key not in payload:
+                payload[key] = default
+                changed = True
+        if not changed:
+            return
+        dest.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        updated.append(filename)
+
     for item in tpl.iterdir():
         if item.name.startswith("."):
             continue
@@ -310,6 +353,7 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
     # Repair known bad state defaults from older bootstrap runs.
     for state_file in ("LIFESTATE.json", "RELATIONSHIP.json", "STYLE_PROFILE.json"):
         _repair_state_json(state_file)
+    _upgrade_lifestate_schema("LIFESTATE.json")
 
     changed = added + [f"{name} (updated)" for name in updated]
     if changed and not silent:

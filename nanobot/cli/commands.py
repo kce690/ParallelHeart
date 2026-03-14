@@ -363,6 +363,7 @@ def gateway(
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
+    from nanobot.companion.life_state.service import LifeStateService
     from nanobot.config.paths import get_cron_dir
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
@@ -386,6 +387,7 @@ def gateway(
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_cron_dir() / "jobs.json"
     cron = CronService(cron_store_path)
+    life_state = LifeStateService(config.workspace_path)
 
     # Create agent with cron service
     agent = AgentLoop(
@@ -399,6 +401,7 @@ def gateway(
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
         cron_service=cron,
+        life_state_service=life_state,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
@@ -515,6 +518,10 @@ def gateway(
         try:
             await cron.start()
             await heartbeat.start()
+            try:
+                await life_state.start()
+            except Exception as exc:
+                console.print(f"[yellow]Warning: LifeState service start failed: {exc}[/yellow]")
             await asyncio.gather(
                 agent.run(),
                 channels.start_all(),
@@ -523,6 +530,7 @@ def gateway(
             console.print("\nShutting down...")
         finally:
             await agent.close_mcp()
+            life_state.stop()
             heartbeat.stop()
             cron.stop()
             agent.stop()
@@ -552,6 +560,7 @@ def agent(
 
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
+    from nanobot.companion.life_state.service import LifeStateService
     from nanobot.config.paths import get_cron_dir
     from nanobot.cron.service import CronService
 
@@ -565,6 +574,7 @@ def agent(
     # Create cron service for tool usage (no callback needed for CLI unless running)
     cron_store_path = get_cron_dir() / "jobs.json"
     cron = CronService(cron_store_path)
+    life_state = LifeStateService(config.workspace_path)
 
     if logs:
         logger.enable("nanobot")
@@ -582,6 +592,7 @@ def agent(
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
         cron_service=cron,
+        life_state_service=life_state,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
@@ -606,6 +617,7 @@ def agent(
     if message:
         # Single message mode — direct call, no bus needed
         async def run_once():
+            await life_state.fast_forward_to_now()
             with _thinking_ctx():
                 response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
             _print_agent_response(response, render_markdown=markdown)
@@ -640,6 +652,10 @@ def agent(
             signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
         async def run_interactive():
+            try:
+                await life_state.start()
+            except Exception as exc:
+                console.print(f"[yellow]Warning: LifeState service start failed: {exc}[/yellow]")
             bus_task = asyncio.create_task(agent_loop.run())
             turn_done = asyncio.Event()
             turn_done.set()
@@ -711,6 +727,7 @@ def agent(
                         console.print("\nGoodbye!")
                         break
             finally:
+                life_state.stop()
                 agent_loop.stop()
                 outbound_task.cancel()
                 await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
