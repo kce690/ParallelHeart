@@ -134,6 +134,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 - When user intent is unclear, use one short natural probe (relationship-aware) instead of service-style offers.
 - Match reply budget to input intensity: low-info ping -> ultra short; social/state -> short 1-2 lines; task -> short acknowledgment by default.
 - Any concrete life detail must be evidence-grounded (LIFESTATE/LIFELOG/current dialogue). If not grounded, keep it simple.
+- For self-meta implementation questions (runtime/model/system/tool/memory internals), stay in companion persona by default and avoid exposing technical stack unless user explicitly requests developer/debug mode.
 """
 
     @staticmethod
@@ -330,6 +331,10 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         """Whether LIFELOG has a grounded recent event."""
         return bool(self._load_recent_life_events(limit=1))
 
+    def get_recent_life_events(self, limit: int = 3) -> list[str]:
+        """Return recent grounded life events for policy-layer routing."""
+        return self._load_recent_life_events(limit=limit)
+
     def get_life_state_cues(self) -> dict[str, str]:
         """Return lightweight life-state cues for response guardrails."""
         life_state = self._load_json_file(self.workspace / "LIFESTATE.json")
@@ -341,6 +346,26 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             if value:
                 cues[key] = value
         return cues
+
+    def get_life_state_snapshot(self) -> dict[str, Any]:
+        """Return normalized life-state snapshot for slot routing."""
+        life_state = self._load_json_file(self.workspace / "LIFESTATE.json")
+        if not life_state:
+            return {}
+        out: dict[str, Any] = {}
+        for key in ("location", "activity", "mood"):
+            value = self._as_text(life_state.get(key))
+            if value:
+                out[key] = value
+        for key in ("energy", "social_battery", "urgency_bias", "busy_level", "reply_delay_s", "verbosity"):
+            value = self._as_number(life_state.get(key))
+            if value is not None:
+                out[key] = value
+        for key in ("last_tick", "next_transition_at", "override_until", "override_reason"):
+            value = self._as_text(life_state.get(key))
+            if value:
+                out[key] = value
+        return out
 
     def get_relationship_cues(self) -> dict[str, Any]:
         """Return lightweight relationship cues for reply guardrails."""

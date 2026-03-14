@@ -57,3 +57,43 @@
 - Ran `sync_workspace_templates()` against `C:\\Users\\10972\\.nanobot\\workspace`.
 - Runtime files updated in place (`LIFESTATE.json` schema fields filled).
 - Ran `LifeStateService.fast_forward_to_now()` once on runtime workspace to initialize `next_transition_at` and recent events.
+
+## 17:14 Audit for follow-up stability issues
+- Reviewed `nanobot/agent/loop.py` message classification + budget + fallback chain.
+- Confirmed state-like questions currently share one broad `state` path and can overuse current snapshot.
+- Confirmed recent events were only prompt-level context, not explicit slot policy evidence.
+- Confirmed implementation-layer self questions had no router guard and could leak runtime identity details.
+
+## 17:22 Patch 6 - Slot router + self-knowledge router
+- Updated `nanobot/agent/loop.py`:
+  - Added `answer_slot` routing (`current_activity`, `previous_activity`, `meal`, `mood`, `availability`, `meta_self`).
+  - Added explicit debug/developer-mode detector for `meta_self`.
+  - Added default persona floor replies for `meta_self` (non-debug path) and bypassed LLM for that path.
+  - Added `task_debug` reply budget for explicit technical/debug context.
+- Updated `nanobot/agent/context.py`:
+  - Added high-priority companion rule: do not expose implementation internals unless explicit debug/developer request.
+  - Added public accessors for policy layer: `get_recent_life_events()` and `get_life_state_snapshot()`.
+
+## 17:31 Patch 7 - Recent-event evidence + anti-repeat
+- Updated `nanobot/agent/loop.py`:
+  - Added slot floor builder using life-state snapshot + recent life events.
+  - Added meal/previous activity evidence enforcement to avoid unsupported concrete details.
+  - Added anti-repeat guard with recent slot-signature memory and short variant fallback.
+  - Synced guarded final output back into transient assistant message before persistence.
+
+## 17:34 Patch 8 - Tests
+- Added `tests/test_loop_answer_slot_policy.py`:
+  - slot routing coverage
+  - meta-self default (non-technical, no LLM call) coverage
+  - explicit debug mode technical reply coverage
+  - state anti-repeat coverage
+
+## 17:39 Validation
+- `python -m py_compile` passed for:
+  - `nanobot/agent/loop.py`
+  - `nanobot/agent/context.py`
+  - `tests/test_loop_answer_slot_policy.py`
+- Local async sanity script (venv) verified:
+  - current activity question uses current-state path
+  - previous activity / meal / mood pull slot-specific floor from recent events or mood cues
+  - meta-self default question no longer returns technical stack details

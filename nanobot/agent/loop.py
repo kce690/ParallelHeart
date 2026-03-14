@@ -73,6 +73,13 @@ class AgentLoop:
         "internal fallback",
         "background task completed",
     )
+    _META_SELF_MARKERS = (
+        "python", "windows", "runtime", "prompt", "system", "tool", "memory file",
+        "模型", "程序", "ai", "机器人", "写的", "实现", "运行", "系统", "提示词", "后端", "框架",
+    )
+    _DEBUG_MODE_MARKERS = (
+        "调试", "debug", "开发者", "技术模式", "实现细节", "系统信息", "认真说", "技术回答", "模型细节",
+    )
 
     def __init__(
         self,
@@ -129,6 +136,7 @@ class AgentLoop:
         self._mcp_connected = False
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self._recent_slot_replies: dict[str, list[dict[str, str]]] = {}
         self._processing_lock = asyncio.Lock()
         self.memory_consolidator = MemoryConsolidator(
             workspace=workspace,
@@ -288,8 +296,74 @@ class AgentLoop:
             "social": {"max_sentences": 2, "max_chars": 16, "min_chars": 2, "allow_followup": True, "allow_explain": False, "allow_detail": False, "strip_punct": True},
             "state": {"max_sentences": 2, "max_chars": 18, "min_chars": 4, "allow_followup": True, "allow_explain": False, "allow_detail": True, "strip_punct": True},
             "task": {"max_sentences": 1, "max_chars": 8, "min_chars": 2, "allow_followup": False, "allow_explain": False, "allow_detail": False, "strip_punct": True},
+            "task_debug": {"max_sentences": 3, "max_chars": 160, "min_chars": 8, "allow_followup": True, "allow_explain": True, "allow_detail": True, "strip_punct": False},
         }
         return budgets.get(category, budgets["social"])
+
+    @classmethod
+    def _route_answer_slot(cls, text: str, category: str) -> str:
+        """Route user query into answer slot for evidence-aware reply policy."""
+        raw = (text or "").strip()
+        _, flat = cls._normalize_user_text(raw)
+        flat_lower = flat.lower()
+        if not flat:
+            return "unknown"
+
+        if cls._is_meta_self_query(raw):
+            return "meta_self"
+
+        has_time_back_ref = bool(re.search(r"(刚才|刚刚|之前|方才|前面|上一会|刚那会)", flat))
+        asks_activity = bool(re.search(r"(在干|在做|忙什么|做什么|在忙|在哪|在干嘛|在干啥)", flat))
+        asks_meal = bool(re.search(r"(吃饭|午饭|晚饭|早饭|早餐|吃了没|吃了吗|吃的什么|饭吃了没)", flat))
+        asks_mood = bool(re.search(r"(心情|开心|难受|烦|情绪|状态怎么样|是不是不开心)", flat))
+        asks_availability = bool(re.search(r"(方便吗|有空吗|能聊吗|是不是刚忙完|忙完了没|现在忙吗)", flat))
+
+        if asks_meal:
+            return "meal"
+        if asks_mood:
+            return "mood"
+        if asks_availability:
+            return "availability"
+        if has_time_back_ref and asks_activity:
+            return "previous_activity"
+        if has_time_back_ref and category == "state":
+            return "previous_activity"
+        if asks_activity or category == "state":
+            return "current_activity"
+        return "unknown"
+
+    @classmethod
+    def _is_meta_self_query(cls, text: str) -> bool:
+        """Detect implementation-layer self questions."""
+        raw = re.sub(r"\s+", "", (text or ""))
+        if not raw:
+            return False
+        if not any(marker in raw.lower() for marker in cls._META_SELF_MARKERS):
+            return False
+        return bool(
+            re.search(
+                r"(你是.*(程序|AI|机器人|模型|写的|做的)|你用什么.*(写|做)|你运行在|你背后|你的模型|你的系统|你是不是.*(程序|AI|机器人))",
+                raw,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    @classmethod
+    def _allow_meta_technical_reply(cls, text: str) -> bool:
+        """Only allow implementation details in explicit debug/developer context."""
+        raw = re.sub(r"\s+", "", (text or "")).lower()
+        if not raw:
+            return False
+        return any(marker in raw for marker in cls._DEBUG_MODE_MARKERS)
+
+    def _build_meta_self_floor_reply(self, user_text: str) -> str:
+        """Companion-style default response for implementation-layer questions."""
+        pool = ("我又不是程序", "你问这个干嘛", "我哪懂这些", "你怎么突然问这个", "你猜")
+        base = re.sub(r"\s+", "", self._strip_weak_input_markup(user_text))
+        seed = sum(ord(ch) for ch in (base or user_text or "0"))
+        idx = (seed + self._intent_probe_counter) % len(pool)
+        self._intent_probe_counter = (self._intent_probe_counter + 1) % 10_000
+        return pool[idx]
 
     @classmethod
     def _is_status_query(cls, text: str) -> bool:
@@ -386,11 +460,27 @@ class AgentLoop:
         user_text: str,
         reply: str | None,
         *,
+        answer_slot: str = "unknown",
+        recent_events: list[str] | None = None,
         has_recent_event: bool,
     ) -> str | None:
         """Remove unsupported concrete life details when evidence is weak."""
         if not reply:
             return reply
+        events = recent_events or []
+        has_meal_event = any(re.search(r"(吃|饭|午饭|晚饭|早饭|早餐)", str(item or "")) for item in events)
+
+        if answer_slot == "meal" and not has_meal_event:
+            text = re.sub(r"\s+", " ", reply).strip()
+            text = re.sub(r"(刚刚?|刚才)?(在)?(外面|家里|学校)?(随便|简单)?吃了[^，。！？!?]{0,24}", "", text).strip(" ，,。！？!?")
+            text = re.sub(r"(午饭|晚饭|早饭|早餐)吃了[^，。！？!?]{0,24}", "", text).strip(" ，,。！？!?")
+            return text or "就普通吃的"
+
+        if answer_slot == "previous_activity" and not has_recent_event:
+            text = re.sub(r"\s+", " ", reply).strip()
+            text = re.sub(r"(刚刚?|刚才|之前)[^，。！？!?]{0,24}", "", text).strip(" ，,。！？!?")
+            return text or "刚刚就那样"
+
         if has_recent_event:
             return reply
 
@@ -440,6 +530,169 @@ class AgentLoop:
         if location:
             return f"在{location}呢"
         return "这会儿歇着呢"
+
+    @staticmethod
+    def _extract_latest_event(events: list[str]) -> str | None:
+        """Pick latest event summary when available."""
+        for item in events:
+            text = re.sub(r"\s+", " ", str(item or "")).strip()
+            if text:
+                return text
+        return None
+
+    @staticmethod
+    def _extract_latest_meal_event(events: list[str]) -> str | None:
+        """Pick latest meal-related event."""
+        for item in events:
+            text = re.sub(r"\s+", " ", str(item or "")).strip()
+            if not text:
+                continue
+            if re.search(r"(吃|饭|午饭|晚饭|早餐|早饭)", text):
+                return text
+        return None
+
+    @staticmethod
+    def _mood_floor(snapshot: dict[str, Any]) -> str:
+        mood = str(snapshot.get("mood") or "")
+        if re.search(r"(烦|低落|丧|差)", mood):
+            return "有点闷"
+        if re.search(r"(开心|不错|好)", mood):
+            return "还挺好的"
+        if re.search(r"(一般|平静|平稳)", mood):
+            return "还行吧"
+        return "就还行"
+
+    @staticmethod
+    def _availability_floor(snapshot: dict[str, Any]) -> str:
+        busy = snapshot.get("busy_level")
+        urgency = snapshot.get("urgency_bias")
+        activity = str(snapshot.get("activity") or "")
+        if isinstance(busy, (int, float)) and busy >= 72:
+            return "这会儿还在忙"
+        if isinstance(urgency, (int, float)) and urgency >= 75:
+            return "还在忙一会儿"
+        if re.search(r"(学习|通勤|开会|工作|忙)", activity):
+            return "还在忙呢"
+        return "这会儿能聊"
+
+    def _build_slot_floor_reply(
+        self,
+        answer_slot: str,
+        user_text: str,
+        snapshot: dict[str, Any],
+        recent_events: list[str],
+    ) -> str | None:
+        """Build evidence-grounded floor reply for each answer slot."""
+        if answer_slot == "meta_self":
+            return self._build_meta_self_floor_reply(user_text)
+
+        if answer_slot == "current_activity":
+            return self._build_state_floor_reply()
+
+        if answer_slot == "previous_activity":
+            latest = self._extract_latest_event(recent_events)
+            if latest:
+                compact = re.sub(r"\s+", "", latest)
+                if len(compact) > 12:
+                    return compact[:12]
+                return compact
+            return "刚刚就那样"
+
+        if answer_slot == "meal":
+            meal_event = self._extract_latest_meal_event(recent_events)
+            if meal_event:
+                compact = re.sub(r"\s+", "", meal_event)
+                if len(compact) > 12:
+                    return compact[:12]
+                return compact
+            stripped = re.sub(r"\s+", "", self._strip_weak_input_markup(user_text))
+            if bool(re.search(r"(吃了没|吃了吗|饭吃了没)", stripped)):
+                return "吃过了"
+            return "就普通吃的"
+
+        if answer_slot == "mood":
+            return self._mood_floor(snapshot)
+
+        if answer_slot == "availability":
+            latest = self._extract_latest_event(recent_events)
+            if latest and re.search(r"(刚|停|歇|回到|忙完)", latest):
+                return "刚停下来"
+            return self._availability_floor(snapshot)
+
+        return None
+
+    @staticmethod
+    def _normalize_reply_signature(text: str) -> str:
+        compact = re.sub(r"[\s，,。！？!?~～…]", "", text or "")
+        compact = re.sub(r"(这会儿|现在|刚刚|刚才|就是|有点|一下|呢|呀|啦|吧)$", "", compact)
+        return compact[:10]
+
+    def _apply_anti_repeat_guard(
+        self,
+        *,
+        session_key: str,
+        answer_slot: str,
+        reply: str | None,
+        slot_floor_reply: str | None,
+    ) -> str | None:
+        """Avoid repeated same-slot semantic loops across recent turns."""
+        if not reply:
+            return reply
+        if answer_slot not in {"current_activity", "previous_activity", "meal", "availability", "mood"}:
+            return reply
+
+        history = self._recent_slot_replies.get(session_key, [])
+        if not history:
+            return reply
+        recent_same_slot = [item for item in reversed(history[-4:]) if item.get("slot") == answer_slot]
+        if not recent_same_slot:
+            return reply
+
+        sig = self._normalize_reply_signature(reply)
+        last_sig = recent_same_slot[0].get("sig", "")
+        if not sig or not last_sig:
+            return reply
+        repeated = sig == last_sig or sig in last_sig or last_sig in sig
+        if not repeated:
+            return reply
+
+        if slot_floor_reply and self._normalize_reply_signature(slot_floor_reply) != last_sig:
+            return slot_floor_reply
+
+        variant = self._anti_repeat_variant(answer_slot)
+        if variant and self._normalize_reply_signature(variant) != last_sig:
+            return variant
+
+        compact = re.sub(r"\s+", "", reply).strip(self._SHORT_REPLY_END_PUNCT)
+        if len(compact) > 8:
+            return compact[:8]
+        return compact or reply
+
+    def _anti_repeat_variant(self, answer_slot: str) -> str | None:
+        """Return short variant when same-slot semantics repeat."""
+        pools: dict[str, tuple[str, ...]] = {
+            "current_activity": ("这会儿就这样", "刚停下来", "嗯就那样"),
+            "previous_activity": ("就刚才那样", "刚那会儿"),
+            "meal": ("就普通吃的", "就简单吃了"),
+            "availability": ("刚停下来", "现在能聊"),
+            "mood": ("就还行", "还行吧"),
+        }
+        pool = pools.get(answer_slot)
+        if not pool:
+            return None
+        idx = self._intent_probe_counter % len(pool)
+        self._intent_probe_counter = (self._intent_probe_counter + 1) % 10_000
+        return pool[idx]
+
+    def _record_reply_signature(self, session_key: str, answer_slot: str, reply: str) -> None:
+        """Record reply signature for anti-repeat checks."""
+        if not reply:
+            return
+        sig = self._normalize_reply_signature(reply)
+        bucket = self._recent_slot_replies.setdefault(session_key, [])
+        bucket.append({"slot": answer_slot, "sig": sig, "text": reply})
+        if len(bucket) > 12:
+            del bucket[:-12]
 
     @classmethod
     def _is_assistant_offer_style(cls, text: str) -> bool:
@@ -500,6 +753,8 @@ class AgentLoop:
         user_text: str,
         reply: str | None,
         *,
+        answer_slot: str = "unknown",
+        recent_events: list[str] | None = None,
         has_recent_event: bool,
         state_floor_reply: str | None = None,
         intent_probe_floor_reply: str | None = None,
@@ -512,7 +767,7 @@ class AgentLoop:
         if not text:
             return None
 
-        if category == "task" and not cls._is_explain_request(user_text):
+        if category == "task" and answer_slot != "meta_self" and not cls._is_explain_request(user_text):
             return cls._short_task_ack(user_text)
         if category == "intent_probe" and cls._is_assistant_offer_style(text):
             text = intent_probe_floor_reply or "怎么了"
@@ -521,12 +776,15 @@ class AgentLoop:
             text = cls._shape_status_reply(
                 user_text,
                 text,
+                answer_slot=answer_slot,
                 has_recent_event=has_recent_event,
             ) or text
 
         text = cls._apply_evidence_constraint(
             user_text,
             text,
+            answer_slot=answer_slot,
+            recent_events=recent_events,
             has_recent_event=has_recent_event,
         ) or text
 
@@ -550,7 +808,7 @@ class AgentLoop:
 
         min_chars = int(budget.get("min_chars", 1))
         compact_len = len(re.sub(r"\s+", "", joined))
-        if category == "state" and (
+        if category == "state" and answer_slot in {"current_activity", "availability"} and (
             compact_len < min_chars or cls._is_low_information_state_reply(joined)
         ):
             joined = (state_floor_reply or "这会儿歇着呢").strip()
@@ -563,6 +821,8 @@ class AgentLoop:
                 joined = "在呢"
             elif category == "task":
                 joined = cls._short_task_ack(user_text)
+            elif category == "task_debug":
+                joined = "说细一点我再认真讲"
             else:
                 joined = "嗯"
 
@@ -575,6 +835,8 @@ class AgentLoop:
                 return intent_probe_floor_reply or "怎么了"
             if category == "state":
                 return "在家休息呢"
+            if category == "task_debug":
+                return "你具体想查哪块"
             return cls._short_task_ack(user_text)
         return joined
 
@@ -618,10 +880,13 @@ class AgentLoop:
         user_text: str,
         reply: str | None,
         *,
+        answer_slot: str,
         has_recent_event: bool,
     ) -> str | None:
         """Constrain casual self-status replies to short, spoken, non-report style."""
         if not reply or not AgentLoop._is_status_query(user_text):
+            return reply
+        if answer_slot not in {"current_activity", "availability"}:
             return reply
 
         text = re.sub(r"\s+", " ", reply).strip()
@@ -660,6 +925,48 @@ class AgentLoop:
                         second = m.group(1)
 
         return f"{first}。{second + '。' if second else ''}"
+
+    @classmethod
+    def _slot_reply_matches(cls, answer_slot: str, reply: str | None) -> bool:
+        """Check whether reply is semantically aligned with slot intent."""
+        if not reply:
+            return False
+        text = re.sub(r"\s+", "", reply)
+        if not text:
+            return False
+        if answer_slot == "current_activity":
+            return bool(re.search(r"(在|忙|歇|外面|在家|路上|休息|学习|通勤)", text))
+        if answer_slot == "previous_activity":
+            return bool(re.search(r"(刚|刚才|之前|方才|刚刚)", text))
+        if answer_slot == "meal":
+            return bool(re.search(r"(吃|饭|没吃|吃过|吃了)", text))
+        if answer_slot == "mood":
+            return bool(re.search(r"(心情|开心|烦|还行|平静|一般|低落|不错)", text))
+        if answer_slot == "availability":
+            return bool(re.search(r"(忙|有空|方便|能聊|刚停|这会儿)", text))
+        if answer_slot == "meta_self":
+            return True
+        return True
+
+    @classmethod
+    def _enforce_slot_answer(
+        cls,
+        answer_slot: str,
+        reply: str | None,
+        *,
+        slot_floor_reply: str | None,
+        allow_meta_technical: bool,
+    ) -> str | None:
+        """Keep slot answer aligned to evidence source and persona boundaries."""
+        if answer_slot == "meta_self" and not allow_meta_technical:
+            return slot_floor_reply or "你问这个干嘛"
+        if not reply:
+            return slot_floor_reply or reply
+        if answer_slot in {"unknown", "meta_self"}:
+            return reply
+        if cls._slot_reply_matches(answer_slot, reply):
+            return reply
+        return slot_floor_reply or reply
 
     async def _run_agent_loop(
         self,
@@ -888,8 +1195,49 @@ class AgentLoop:
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
         category = self._classify_input_intensity(msg.content)
+        answer_slot = self._route_answer_slot(msg.content, category)
+        allow_meta_technical = answer_slot == "meta_self" and self._allow_meta_technical_reply(msg.content)
+        effective_category = "task_debug" if answer_slot == "meta_self" and allow_meta_technical else category
+        state_snapshot = self.context.get_life_state_snapshot()
+        recent_events = self.context.get_recent_life_events(limit=5)
+        has_recent_event = bool(recent_events)
         state_floor_reply = self._build_state_floor_reply() if category == "state" else None
         intent_probe_floor_reply = self._build_intent_probe_reply(msg.content) if category == "intent_probe" else None
+        slot_floor_reply = self._build_slot_floor_reply(
+            answer_slot,
+            msg.content,
+            state_snapshot,
+            recent_events,
+        )
+
+        if answer_slot == "meta_self" and not allow_meta_technical:
+            final_content = self._enforce_slot_answer(
+                answer_slot,
+                slot_floor_reply,
+                slot_floor_reply=slot_floor_reply,
+                allow_meta_technical=allow_meta_technical,
+            )
+            final_content = self._apply_anti_repeat_guard(
+                session_key=key,
+                answer_slot=answer_slot,
+                reply=final_content,
+                slot_floor_reply=slot_floor_reply,
+            ) or final_content
+            final_content = self._strip_short_reply_terminal_punct(msg.content, final_content) or final_content
+            if not final_content:
+                return None
+            from datetime import datetime
+
+            session.messages.append({"role": "user", "content": msg.content, "timestamp": datetime.now().isoformat()})
+            session.messages.append({"role": "assistant", "content": final_content, "timestamp": datetime.now().isoformat()})
+            session.updated_at = datetime.now()
+            self._record_reply_signature(key, answer_slot, final_content)
+            self.sessions.save(session)
+            await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content=final_content,
+                metadata=msg.metadata or {},
+            )
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
@@ -917,12 +1265,28 @@ class AgentLoop:
         )
 
         final_content = self._enforce_reply_budget(
-            category,
+            effective_category,
             msg.content,
             final_content,
-            has_recent_event=self.context.has_recent_life_event(),
+            answer_slot=answer_slot,
+            recent_events=recent_events,
+            has_recent_event=has_recent_event,
             state_floor_reply=state_floor_reply,
             intent_probe_floor_reply=intent_probe_floor_reply,
+        ) or final_content
+
+        final_content = self._enforce_slot_answer(
+            answer_slot,
+            final_content,
+            slot_floor_reply=slot_floor_reply,
+            allow_meta_technical=allow_meta_technical,
+        ) or final_content
+
+        final_content = self._apply_anti_repeat_guard(
+            session_key=key,
+            answer_slot=answer_slot,
+            reply=final_content,
+            slot_floor_reply=slot_floor_reply,
         ) or final_content
 
         final_content = self._strip_short_reply_terminal_punct(
@@ -938,11 +1302,14 @@ class AgentLoop:
                 safe_short = (intent_probe_floor_reply or "怎么了").strip()
             elif category in {"ping", "social"}:
                 safe_short = "在呢"
+            elif answer_slot == "meta_self" and not allow_meta_technical:
+                safe_short = slot_floor_reply or "你问这个干嘛"
             if safe_short:
                 from datetime import datetime
                 session.messages.append(
                     {"role": "assistant", "content": safe_short, "timestamp": datetime.now().isoformat()}
                 )
+                self._record_reply_signature(key, answer_slot, safe_short)
             self.sessions.save(session)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
             if safe_short:
@@ -952,7 +1319,9 @@ class AgentLoop:
                 )
             return None
 
+        self._replace_last_assistant_content(all_msgs, final_content)
         self._save_turn(session, all_msgs, 1 + len(history))
+        self._record_reply_signature(key, answer_slot, final_content)
         self.sessions.save(session)
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
@@ -965,6 +1334,18 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=msg.metadata or {},
         )
+
+    @staticmethod
+    def _replace_last_assistant_content(messages: list[dict], content: str) -> None:
+        """Replace the final assistant text in transient message list with guarded output."""
+        for i in range(len(messages) - 1, -1, -1):
+            item = messages[i]
+            if item.get("role") != "assistant":
+                continue
+            if item.get("tool_calls"):
+                continue
+            item["content"] = content
+            break
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """Save new-turn messages into session, truncating large tool results."""
