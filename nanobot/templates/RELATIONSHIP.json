@@ -1,0 +1,10 @@
+{
+  "stage": "暧昧",
+  "intimacy": 0.35,
+  "trust": 0.4,
+  "conflict_last7d": 0,
+  "user_preference": {
+    "emoji_density": "low",
+    "late_reply_ok": true
+  }
+}

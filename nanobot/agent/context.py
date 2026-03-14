@@ -1,6 +1,8 @@
 """Context builder for assembling agent prompts."""
 
 import base64
+import json
+import logging
 import mimetypes
 import platform
 import time
@@ -11,6 +13,9 @@ from typing import Any
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 from nanobot.utils.helpers import build_assistant_message, detect_image_mime
+
+
+logger = logging.getLogger(__name__)
 
 
 class ContextBuilder:
@@ -31,6 +36,10 @@ class ContextBuilder:
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
+
+        state_sections = self._load_state_sections()
+        if state_sections:
+            parts.append(state_sections)
 
         memory = self.memory.get_memory_context()
         if memory:
@@ -117,6 +126,112 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
                 parts.append(f"## {filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
+
+    def _load_state_sections(self) -> str:
+        """Load optional life/relationship/style state files for system prompt context."""
+        sections: list[str] = []
+
+        life_state = self._load_json_file(self.workspace / "LIFESTATE.json")
+        if life_state:
+            lines = []
+            location = self._as_text(life_state.get("location"))
+            if location:
+                lines.append(f"- Location: {location}")
+            activity = self._as_text(life_state.get("activity"))
+            if activity:
+                lines.append(f"- Activity: {activity}")
+            mood = self._as_text(life_state.get("mood"))
+            if mood:
+                lines.append(f"- Mood: {mood}")
+            energy = self._as_number(life_state.get("energy"))
+            if energy is not None:
+                lines.append(f"- Energy: {energy}")
+            last_update = self._as_text(life_state.get("last_update"))
+            if last_update:
+                lines.append(f"- Last update: {last_update}")
+            if lines:
+                sections.append("# Current Life State\n\n" + "\n".join(lines))
+
+        relationship = self._load_json_file(self.workspace / "RELATIONSHIP.json")
+        if relationship:
+            lines = []
+            stage = self._as_text(relationship.get("stage"))
+            if stage:
+                lines.append(f"- Stage: {stage}")
+            intimacy = self._as_number(relationship.get("intimacy"))
+            if intimacy is not None:
+                lines.append(f"- Intimacy: {intimacy}")
+            trust = self._as_number(relationship.get("trust"))
+            if trust is not None:
+                lines.append(f"- Trust: {trust}")
+            conflict = self._as_number(relationship.get("conflict_last7d"))
+            if conflict is not None:
+                lines.append(f"- Conflict (last 7d): {conflict}")
+            preference = relationship.get("user_preference")
+            if isinstance(preference, dict):
+                emoji_density = self._as_text(preference.get("emoji_density"))
+                if emoji_density:
+                    lines.append(f"- User preference (emoji density): {emoji_density}")
+                late_reply_ok = preference.get("late_reply_ok")
+                if isinstance(late_reply_ok, bool):
+                    lines.append(f"- User preference (late reply ok): {str(late_reply_ok).lower()}")
+            if lines:
+                sections.append("# Relationship State\n\n" + "\n".join(lines))
+
+        style_profile = self._load_json_file(self.workspace / "STYLE_PROFILE.json")
+        if style_profile:
+            lines = []
+            verbosity = self._as_number(style_profile.get("verbosity"))
+            if verbosity is not None:
+                lines.append(f"- Verbosity: {verbosity}")
+            reply_delay = self._as_number(style_profile.get("reply_delay_s"))
+            if reply_delay is not None:
+                lines.append(f"- Reply delay (s): {reply_delay}")
+            emoji = self._as_text(style_profile.get("emoji"))
+            if emoji:
+                lines.append(f"- Emoji style: {emoji}")
+            tone = self._as_text(style_profile.get("tone"))
+            if tone:
+                lines.append(f"- Tone: {tone}")
+            if lines:
+                sections.append("# Style Profile\n\n" + "\n".join(lines))
+
+        return "\n\n".join(sections)
+
+    def _load_json_file(self, path: Path) -> dict[str, Any] | None:
+        """Safely read JSON object from file."""
+        if not path.exists():
+            return None
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+            if not raw:
+                return None
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data
+            logger.warning("State file %s does not contain a JSON object", path)
+        except Exception as exc:
+            logger.warning("Failed to load state file %s: %s", path, exc)
+        return None
+
+    @staticmethod
+    def _as_text(value: Any) -> str | None:
+        """Convert simple scalar value to text."""
+        if value is None:
+            return None
+        if isinstance(value, (str, int, float, bool)):
+            text = str(value).strip()
+            return text or None
+        return None
+
+    @staticmethod
+    def _as_number(value: Any) -> int | float | None:
+        """Return numeric value when available."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return value
+        return None
 
     def build_messages(
         self,

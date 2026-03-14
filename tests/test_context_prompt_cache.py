@@ -8,6 +8,7 @@ from pathlib import Path
 import datetime as datetime_module
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.utils.helpers import sync_workspace_templates
 
 
 class _FakeDatetime(real_datetime):
@@ -71,3 +72,39 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert "Channel: cli" in user_content
     assert "Chat ID: direct" in user_content
     assert "Return exactly: OK" in user_content
+
+
+def test_sync_workspace_templates_creates_life_state_files(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+
+    added = sync_workspace_templates(workspace, silent=True)
+
+    assert "LIFESTATE.json" in added
+    assert "RELATIONSHIP.json" in added
+    assert "STYLE_PROFILE.json" in added
+    assert "LIFELOG.md" in added
+
+
+def test_system_prompt_includes_state_sections(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    sync_workspace_templates(workspace, silent=True)
+    builder = ContextBuilder(workspace)
+
+    prompt = builder.build_system_prompt()
+
+    assert "# Current Life State" in prompt
+    assert "- Location: 家" in prompt
+    assert "# Relationship State" in prompt
+    assert "- Stage: 暧昧" in prompt
+    assert "# Style Profile" in prompt
+    assert "- Tone: gentle" in prompt
+
+
+def test_invalid_state_json_does_not_break_system_prompt(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    (workspace / "LIFESTATE.json").write_text("{", encoding="utf-8")
+    builder = ContextBuilder(workspace)
+
+    prompt = builder.build_system_prompt()
+
+    assert "# Current Life State" not in prompt
