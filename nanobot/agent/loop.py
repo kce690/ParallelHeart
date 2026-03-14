@@ -52,17 +52,18 @@ class AgentLoop:
         "嗯", "嗯嗯", "哦", "噢", "啊", "哈", "哈哈", "诶", "欸", "哎",
         "emm", "emmm", "hh", "hhh", "...", "。。。", "…", "?", "？", "!", "！", ".", "。",
     )
-    _WEAK_INPUT_REPLIES = ("咋啦", "干嘛", "在呢", "怎么了", "嗯")
-    _STATUS_QUERY_HINTS = (
-        "你在干什么", "你现在在干嘛", "你现在在干什么", "干嘛呢",
-        "在吗", "你在吗", "你现在在吗", "你现在在干嘛呢", "你是不是刚忙完", "你现在方便聊吗",
-    )
     _KNOWLEDGE_PROBE_HINTS = (
         "你知道", "你懂", "你会", "这个你会吗", "这个你知道吗",
         "这个你懂吗", "什么意思吗", "这个什么意思", "这个你知道什么意思吗",
     )
     _EXPLAIN_REQUEST_HINTS = ("讲", "讲讲", "详细讲", "展开说", "解释一下")
-    _SOCIAL_PING_HINTS = ("想我了吗", "在吗", "在不在", "干嘛呢", "干嘛", "咋不说话")
+    _INTENT_PROBE_HELPER_MARKERS = (
+        "我能怎么帮助你",
+        "有什么可以帮你",
+        "请告诉我你的需求",
+        "我在这里为你服务",
+        "需要我帮你",
+    )
     _INTERNAL_FALLBACK_MARKERS = (
         "i've completed processing but have no response to give",
         "no response",
@@ -118,6 +119,7 @@ class AgentLoop:
         )
 
         self._running = False
+        self._intent_probe_counter = 0
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
@@ -201,9 +203,90 @@ class AgentLoop:
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
     @classmethod
+    def _normalize_user_text(cls, text: str) -> tuple[str, str]:
+        """Return (stripped, flat-no-space) user text after markup cleanup."""
+        stripped = cls._strip_weak_input_markup((text or "").strip())
+        flat = re.sub(r"\s+", "", stripped)
+        return stripped, flat
+
+    @classmethod
+    def _classify_input_intensity(cls, text: str) -> str:
+        """Classify incoming user text into ping/social/state/task/intent_probe."""
+        raw = (text or "").strip()
+        stripped, flat = cls._normalize_user_text(raw)
+        if not flat:
+            return "ping"
+        flat_lower = flat.lower()
+
+        length = len(flat)
+        question_like = bool(re.search(r"[?？]", raw) or re.search(r"[吗嘛么呢啊呀]$", flat))
+        unique_ratio = len(set(flat)) / max(1, length)
+        low_density = length <= 4 and (unique_ratio < 0.85 or question_like)
+        greeting_signal = bool(re.fullmatch(r"(hi+|hello+|hey+|yo+)", flat_lower))
+        explicit_social_signal = bool(re.search(r"(想.{0,2}我|想不想我|想我了吗|陪我|抱抱|亲亲|爱不爱)", flat))
+        explicit_task_request = bool(re.search(r"(帮我|请|麻烦|解释|讲讲|详细|展开|分析|总结|翻译|查|算|写|告诉我|怎么做)", flat))
+        explicit_why_or_meaning = bool(re.search(r"(定义|原理|公式|步骤|推导|证明|什么意思|是什么|为什么|如何)", flat))
+        presence_ping = bool(re.fullmatch(r"(你)?在吗|在不在|在么|在嘛", flat))
+        weak_like_social = bool(
+            cls._is_weak_input(raw)
+            or greeting_signal
+            or presence_ping
+            or low_density
+            or bool(re.search(r"(戳一戳|戳你|戳)", flat))
+        )
+
+        state_signal = bool(
+            re.search(
+                r"(你.{0,3}(在|忙|干|哪|吃|睡|方便|啥)|你在哪|你在干什么|你在干啥|告诉我你在干什么|忙吗|吃饭了没|干嘛呢|干啥呢)",
+                flat,
+            )
+        ) and not presence_ping
+        social_signal = explicit_social_signal
+        task_signal = (
+            cls._is_knowledge_probe(raw)
+            or explicit_task_request
+            or explicit_why_or_meaning
+        )
+
+        # state is higher priority for self-status queries.
+        if state_signal:
+            return "state"
+
+        if task_signal:
+            return "task"
+        if social_signal:
+            return "social"
+
+        intent_probe_signal = weak_like_social and not task_signal and not state_signal and not social_signal
+        if intent_probe_signal:
+            return "intent_probe"
+
+        if cls._is_weak_input(raw):
+            return "ping"
+        if low_density:
+            return "ping"
+        if question_like and length <= 12 and not explicit_why_or_meaning:
+            return "social"
+        if length <= 6 and greeting_signal:
+            return "intent_probe"
+        if length <= 6:
+            return "social"
+        return "task" if question_like else "social"
+
+    @classmethod
+    def _reply_budget(cls, category: str) -> dict[str, int | bool]:
+        budgets: dict[str, dict[str, int | bool]] = {
+            "ping": {"max_sentences": 1, "max_chars": 6, "min_chars": 1, "allow_followup": False, "allow_explain": False, "allow_detail": False, "strip_punct": True},
+            "intent_probe": {"max_sentences": 1, "max_chars": 8, "min_chars": 2, "allow_followup": False, "allow_explain": False, "allow_detail": False, "strip_punct": True},
+            "social": {"max_sentences": 2, "max_chars": 16, "min_chars": 2, "allow_followup": True, "allow_explain": False, "allow_detail": False, "strip_punct": True},
+            "state": {"max_sentences": 2, "max_chars": 18, "min_chars": 4, "allow_followup": True, "allow_explain": False, "allow_detail": True, "strip_punct": True},
+            "task": {"max_sentences": 1, "max_chars": 8, "min_chars": 2, "allow_followup": False, "allow_explain": False, "allow_detail": False, "strip_punct": True},
+        }
+        return budgets.get(category, budgets["social"])
+
+    @classmethod
     def _is_status_query(cls, text: str) -> bool:
-        msg = (text or "").strip()
-        return any(hint in msg for hint in cls._STATUS_QUERY_HINTS)
+        return cls._classify_input_intensity(text) == "state"
 
     @classmethod
     def _is_explain_request(cls, text: str) -> bool:
@@ -212,27 +295,16 @@ class AgentLoop:
 
     @classmethod
     def _is_knowledge_probe(cls, text: str) -> bool:
-        msg = (text or "").strip()
+        msg = re.sub(r"\s+", "", (text or ""))
         if not msg:
             return False
         if cls._is_explain_request(msg):
             return False
         if "吗" not in msg and "？" not in msg and "?" not in msg:
             return False
-        return any(hint in msg for hint in cls._KNOWLEDGE_PROBE_HINTS)
-
-    @classmethod
-    def _shape_knowledge_probe_reply(cls, user_text: str, reply: str | None) -> str | None:
-        """For knowledge probes, default to a very short acknowledgement."""
-        if not reply or not cls._is_knowledge_probe(user_text):
-            return reply
-
-        msg = (user_text or "").strip()
-        if "会" in msg or "懂" in msg:
-            return "会一点"
-        if "什么意思" in msg:
-            return "知道"
-        return "知道啊"
+        if any(hint in msg for hint in cls._KNOWLEDGE_PROBE_HINTS):
+            return True
+        return bool(re.search(r"(知道|懂|会|什么意思|是什么|能不能).*([吗么]|[?？])$", msg))
 
     @staticmethod
     def _strip_weak_input_markup(text: str) -> str:
@@ -274,54 +346,17 @@ class AgentLoop:
             return True
         if len(flat) == 1 and re.fullmatch(r"[A-Za-z0-9\u4e00-\u9fff]", flat):
             return True
-        if len(flat) <= 2 and flat in {"哈", "啊", "哦", "嗯", "噢", "诶", "欸", "哎"}:
+        if len(flat) <= 2 and flat in {"哈", "啊", "哦", "嗯", "噢", "诶", "欸", "哎", "哼"}:
+            return True
+        # Repeated mood particles like 哈哈/嘻嘻/嗯哼/嘿嘿 should be ping.
+        if bool(re.fullmatch(r"(哈|呵|嘻|嘿|嗯|哦|噢|哼|诶|欸|啊){1,4}", flat)):
             return True
         return False
 
     @classmethod
-    def _shape_weak_input_reply(cls, user_text: str) -> str | None:
-        """Short-circuit weak input with very short casual replies."""
-        if not cls._is_weak_input(user_text):
-            return None
-
-        raw = (user_text or "").strip()
-        if not raw:
-            return "在呢"
-
-        stripped = cls._strip_weak_input_markup(raw)
-        flat = re.sub(r"\s+", "", stripped)
-        if flat in {"嗯", "嗯嗯", "哦", "噢", "啊", "哈", "哈哈", "诶", "欸", "哎"}:
-            return "嗯"
-        if re.search(r"[?？]", raw):
-            return "怎么了"
-
-        seed = sum(ord(ch) for ch in raw) % len(cls._WEAK_INPUT_REPLIES)
-        return cls._WEAK_INPUT_REPLIES[seed]
-
-    @classmethod
     def _is_social_ping(cls, text: str) -> bool:
         """Detect short social ping/chitchat turns that should get short replies."""
-        msg = re.sub(r"[\s，,。！？!?~～]+", "", (text or ""))
-        if not msg or len(msg) > 12:
-            return False
-        return any(hint in msg for hint in cls._SOCIAL_PING_HINTS)
-
-    @classmethod
-    def _shape_social_ping_reply(cls, user_text: str) -> str | None:
-        """Return short casual reply for social pings."""
-        if not cls._is_social_ping(user_text):
-            return None
-
-        msg = re.sub(r"[\s，,。！？!?~～]+", "", (user_text or ""))
-        if "想我" in msg:
-            return "想呀"
-        if "干嘛" in msg:
-            return "歇着呢"
-        if "咋不说话" in msg:
-            return "在呢"
-        if "在" in msg:
-            return "在呢"
-        return "在呢"
+        return cls._classify_input_intensity(text) == "social"
 
     @classmethod
     def _is_internal_fallback_output(cls, text: str | None) -> bool:
@@ -339,6 +374,204 @@ class AgentLoop:
         return False
 
     @classmethod
+    def _apply_evidence_constraint(
+        cls,
+        user_text: str,
+        reply: str | None,
+        *,
+        has_recent_event: bool,
+    ) -> str | None:
+        """Remove unsupported concrete life details when evidence is weak."""
+        if not reply:
+            return reply
+        if has_recent_event:
+            return reply
+
+        user_flat = re.sub(r"\s+", "", cls._strip_weak_input_markup(user_text))
+        user_mentions_detail = bool(re.search(r"(刚|整理|文件|窗外|午饭|忙完|处理|更新|吃完|有空)", user_flat))
+        if user_mentions_detail:
+            return reply
+
+        text = re.sub(r"\s+", " ", reply).strip()
+        text = re.sub(r"(，|,)?刚刚?[^，。！？!?]{0,26}", "", text).strip(" ，,")
+        text = re.sub(r"(，|,)?刚才[^，。！？!?]{0,26}", "", text).strip(" ，,")
+        text = re.sub(r"(整理文件|看看窗外|处理完一些事情|忙完一些工作|更新了一些内容|正好有空)", "", text)
+        text = re.sub(r"\s+", " ", text).strip(" ，,。！？!?")
+        return text or None
+
+    @classmethod
+    def _short_task_ack(cls, user_text: str) -> str:
+        msg = re.sub(r"\s+", "", user_text or "")
+        if "会" in msg or "懂" in msg:
+            return "会一点"
+        if "什么意思" in msg:
+            return "知道"
+        return "知道啊"
+
+    @staticmethod
+    def _is_low_information_state_reply(text: str) -> bool:
+        compact = re.sub(r"\s+", "", text or "")
+        return compact in {
+            "嗯", "在呢", "怎么了", "咋啦", "干嘛", "你说",
+            "知道", "知道啊", "会一点",
+        }
+
+    def _build_state_floor_reply(self) -> str:
+        """Build a short state-relevant fallback from life-state cues."""
+        cues = self.context.get_life_state_cues()
+        location = str(cues.get("location") or "")
+        activity = str(cues.get("activity") or "")
+        mood = str(cues.get("mood") or "")
+        merged = f"{location} {activity} {mood}"
+
+        if re.search(r"(路上|外面|在外|出门|通勤|地铁|公交)", merged):
+            return "在外面呢"
+        if re.search(r"(忙|工作|上班|开会|学习|赶)", merged):
+            return "在忙呢"
+        if re.search(r"(家|在家|休息|躺|歇|放松)", merged):
+            return "在家歇着呢"
+        if location:
+            return f"在{location}呢"
+        return "这会儿歇着呢"
+
+    @classmethod
+    def _is_assistant_offer_style(cls, text: str) -> bool:
+        compact = re.sub(r"\s+", "", text or "")
+        if not compact:
+            return False
+        if any(marker in compact for marker in cls._INTENT_PROBE_HELPER_MARKERS):
+            return True
+        return bool(re.search(r"(帮助你|帮到你|你的需求|为你服务|等待你的指令|待命)", compact))
+
+    def _relationship_probe_tier(self) -> str:
+        """Return low/mid/high tier from relationship cues."""
+        cues = self.context.get_relationship_cues()
+        stage = str(cues.get("stage") or "")
+        score = cues.get("intimacy")
+        if score is None:
+            score = cues.get("trust")
+
+        level: float | None = None
+        if isinstance(score, (int, float)):
+            level = float(score)
+            if 0.0 <= level <= 1.5:
+                level *= 100.0
+
+        stage_high = bool(re.search(r"(恋人|情侣|伴侣|暧昧|亲密|close|partner)", stage, flags=re.IGNORECASE))
+        stage_low = bool(re.search(r"(陌生|初识|客套|formal|distant)", stage, flags=re.IGNORECASE))
+        if level is None:
+            if stage_high:
+                return "high"
+            if stage_low:
+                return "low"
+            return "mid"
+        if level >= 70:
+            return "high"
+        if level < 35:
+            return "low"
+        return "mid"
+
+    def _build_intent_probe_reply(self, user_text: str) -> str:
+        """Build a short relationship-aware probe reply for unknown intent."""
+        tier = self._relationship_probe_tier()
+        pools: dict[str, tuple[str, ...]] = {
+            "low": ("怎么了", "有事吗", "干嘛呀", "咋啦"),
+            "mid": ("怎么啦", "干嘛呢", "找我呀", "你想说啥"),
+            "high": ("怎么啦宝宝", "干嘛呀宝宝", "是不是想我了", "想我啦"),
+        }
+        pool = pools.get(tier, pools["mid"])
+        base = re.sub(r"\s+", "", self._strip_weak_input_markup(user_text))
+        seed = sum(ord(ch) for ch in (base or user_text or "0"))
+        idx = (seed + self._intent_probe_counter) % len(pool)
+        self._intent_probe_counter = (self._intent_probe_counter + 1) % 10_000
+        return pool[idx]
+
+    @classmethod
+    def _enforce_reply_budget(
+        cls,
+        category: str,
+        user_text: str,
+        reply: str | None,
+        *,
+        has_recent_event: bool,
+        state_floor_reply: str | None = None,
+        intent_probe_floor_reply: str | None = None,
+    ) -> str | None:
+        """Apply unified response budget and behavior limits by category."""
+        if not reply:
+            return reply
+
+        text = re.sub(r"\s+", " ", reply).strip()
+        if not text:
+            return None
+
+        if category == "task" and not cls._is_explain_request(user_text):
+            return cls._short_task_ack(user_text)
+        if category == "intent_probe" and cls._is_assistant_offer_style(text):
+            text = intent_probe_floor_reply or "怎么了"
+
+        if category == "state":
+            text = cls._shape_status_reply(
+                user_text,
+                text,
+                has_recent_event=has_recent_event,
+            ) or text
+
+        text = cls._apply_evidence_constraint(
+            user_text,
+            text,
+            has_recent_event=has_recent_event,
+        ) or text
+
+        budget = cls._reply_budget(category)
+        parts = [p.strip(" ，,。！？!?") for p in re.split(r"[。！？!?]", text) if p.strip()]
+        if not parts:
+            return None
+        parts = parts[: int(budget["max_sentences"])]
+
+        if not bool(budget["allow_followup"]) and len(parts) > 1:
+            parts = parts[:1]
+
+        joined = " ".join(parts).strip()
+        if re.search(r"(请问|安排|帮助|服务|计划|有什么安排)", joined):
+            joined = re.sub(r"(请问|安排|帮助|服务|计划|有什么安排)", "", joined).strip(" ，,")
+
+        max_chars = int(budget["max_chars"])
+        if len(re.sub(r"\s+", "", joined)) > max_chars:
+            compact = re.sub(r"\s+", "", joined)
+            joined = compact[:max_chars].strip()
+
+        min_chars = int(budget.get("min_chars", 1))
+        compact_len = len(re.sub(r"\s+", "", joined))
+        if category == "state" and (
+            compact_len < min_chars or cls._is_low_information_state_reply(joined)
+        ):
+            joined = (state_floor_reply or "这会儿歇着呢").strip()
+        elif category == "intent_probe" and (
+            compact_len < min_chars or cls._is_assistant_offer_style(joined)
+        ):
+            joined = (intent_probe_floor_reply or "怎么了").strip()
+        elif compact_len < min_chars:
+            if category == "social":
+                joined = "在呢"
+            elif category == "task":
+                joined = cls._short_task_ack(user_text)
+            else:
+                joined = "嗯"
+
+        if bool(budget["strip_punct"]):
+            joined = joined.rstrip(cls._SHORT_REPLY_END_PUNCT).strip()
+        if not joined:
+            if category in {"ping", "social"}:
+                return "在呢"
+            if category == "intent_probe":
+                return intent_probe_floor_reply or "怎么了"
+            if category == "state":
+                return "在家休息呢"
+            return cls._short_task_ack(user_text)
+        return joined
+
+    @classmethod
     def _strip_short_reply_terminal_punct(cls, user_text: str, reply: str | None) -> str | None:
         """For short casual replies, remove sentence-final punctuation."""
         if not reply:
@@ -352,6 +585,7 @@ class AgentLoop:
             or cls._is_knowledge_probe(user_text)
             or cls._is_weak_input(user_text)
             or cls._is_social_ping(user_text)
+            or cls._classify_input_intensity(user_text) == "intent_probe"
         )
 
         if forced and re.search(r"[。！？!?]", text):
@@ -575,34 +809,6 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
-    async def _persist_short_reply(
-        self,
-        session: Session,
-        *,
-        user_text: str,
-        reply_text: str,
-    ) -> None:
-        """Persist a direct short-reply turn without calling the LLM loop."""
-        from datetime import datetime
-
-        session.messages.append(
-            {
-                "role": "user",
-                "content": user_text,
-                "timestamp": datetime.now().isoformat(),
-            }
-        )
-        session.messages.append(
-            {
-                "role": "assistant",
-                "content": reply_text,
-                "timestamp": datetime.now().isoformat(),
-            }
-        )
-        session.updated_at = datetime.now()
-        self.sessions.save(session)
-        await self.memory_consolidator.maybe_consolidate_by_tokens(session)
-
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -674,27 +880,9 @@ class AgentLoop:
             )
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
-        weak_reply = self._shape_weak_input_reply(msg.content)
-        if weak_reply:
-            await self._persist_short_reply(session, user_text=msg.content, reply_text=weak_reply)
-            logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, weak_reply)
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=weak_reply,
-                metadata=msg.metadata or {},
-            )
-
-        social_reply = self._shape_social_ping_reply(msg.content)
-        if social_reply:
-            await self._persist_short_reply(session, user_text=msg.content, reply_text=social_reply)
-            logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, social_reply)
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=social_reply,
-                metadata=msg.metadata or {},
-            )
+        category = self._classify_input_intensity(msg.content)
+        state_floor_reply = self._build_state_floor_reply() if category == "state" else None
+        intent_probe_floor_reply = self._build_intent_probe_reply(msg.content) if category == "intent_probe" else None
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
@@ -721,15 +909,13 @@ class AgentLoop:
             initial_messages, on_progress=on_progress or _bus_progress,
         )
 
-        final_content = self._shape_knowledge_probe_reply(
-            msg.content,
-            final_content,
-        ) or final_content
-
-        final_content = self._shape_status_reply(
+        final_content = self._enforce_reply_budget(
+            category,
             msg.content,
             final_content,
             has_recent_event=self.context.has_recent_life_event(),
+            state_floor_reply=state_floor_reply,
+            intent_probe_floor_reply=intent_probe_floor_reply,
         ) or final_content
 
         final_content = self._strip_short_reply_terminal_punct(
@@ -740,8 +926,23 @@ class AgentLoop:
         if self._is_internal_fallback_output(final_content):
             logger.warning("Suppressing internal fallback output for {}:{}", msg.channel, msg.sender_id)
             self._save_turn(session, all_msgs, 1 + len(history))
+            safe_short = None
+            if category == "intent_probe":
+                safe_short = (intent_probe_floor_reply or "怎么了").strip()
+            elif category in {"ping", "social"}:
+                safe_short = "在呢"
+            if safe_short:
+                from datetime import datetime
+                session.messages.append(
+                    {"role": "assistant", "content": safe_short, "timestamp": datetime.now().isoformat()}
+                )
             self.sessions.save(session)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+            if safe_short:
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id, content=safe_short,
+                    metadata=msg.metadata or {},
+                )
             return None
 
         self._save_turn(session, all_msgs, 1 + len(history))

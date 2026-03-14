@@ -336,3 +336,109 @@
 ### Verification
 - `python -m py_compile nanobot/agent/loop.py nanobot/agent/memory.py nanobot/agent/context.py tests/test_loop_internal_guard.py` passed.
 - `pytest` run is still blocked in this environment due missing dependency `loguru`.
+## Ninth refinement append (2026-03-14): unified input-intensity classifier + reply budgeter + evidence guard
+### Audit conclusion (before patch)
+- Existing chain still had branch-by-branch patches (`weak/social/status/knowledge`) rather than one unified policy.
+- Inputs missing exact branch fit could fall back to normal LLM generation and over-expand.
+- This caused: fabricated life details, template-like follow-up questions, and occasional style regression.
+
+### What changed
+1. `nanobot/agent/loop.py`
+- Added unified input-intensity classifier:
+  - `_classify_input_intensity(text)` -> `ping | social | state | task`
+  - uses combined features (length, question-ness, semantic density, weak-input markers, task/state/social signals)
+  - no longer relies on exact full-sentence whitelist matching.
+- Added unified reply budgeter:
+  - `_reply_budget(category)`
+  - `_enforce_reply_budget(category, user_text, reply, has_recent_event=...)`
+  - controls max sentences, max chars, follow-up allowance, default task behavior.
+- Added evidence guard:
+  - `_apply_evidence_constraint(...)`
+  - strips unsupported concrete life details when no recent event and no dialogue evidence.
+- Unified processing path in `_process_message`:
+  - compute `category = _classify_input_intensity(msg.content)` once
+  - `ping/social` -> direct short reply branch + budget enforcement (no LLM expansion)
+  - others -> LLM, then unified budget + evidence enforcement
+- Kept and integrated internal fallback suppression:
+  - no-response/internal placeholders are not sent out and not leaked.
+
+2. `nanobot/agent/context.py`
+- Added high-priority rule lines to align with runtime policy:
+  - input-intensity based response budget
+  - concrete life details must be evidence-grounded.
+
+3. `tests/test_loop_input_policy.py`
+- Added tests for:
+  - classifier categories (ping/social/state/task)
+  - task default short-ack behavior
+  - evidence constraint stripping unsupported life-detail fillers
+  - social budget limiting template-like follow-up expansion.
+
+### Verification
+- `python -m py_compile nanobot/agent/loop.py nanobot/agent/context.py nanobot/agent/memory.py tests/test_loop_input_policy.py tests/test_loop_internal_guard.py` passed.
+- `pytest` execution remains blocked in this environment because `loguru` is missing.
+## Tenth refinement append (2026-03-14): remove direct whitelist replies, enforce AI-first + relevance floor
+### Audit conclusion (before patch)
+- `_process_message(...)` still had a direct-return branch for `ping/social` that bypassed `_run_agent_loop(...)`.
+- That made behavior look like `if input then fixed short reply`, and could produce off-topic outputs for state asks (`你在干什么 -> 嗯/干嘛`).
+- User requirement in this round: pass through AI first, and short replies must stay on-topic.
+
+### Changes
+1. `nanobot/agent/loop.py`
+- Removed `ping/social` direct-return branch from `_process_message(...)`.
+- Unified path now always calls `_run_agent_loop(...)`, then applies `_enforce_reply_budget(...)`.
+- Added `min_chars` to reply budgets (`ping=1`, `social=2`, `state=4`, `task=2`).
+- Added `_is_low_information_state_reply(...)` to catch weak/off-topic state answers (`嗯/在呢/怎么了/知道啊/...`).
+- Added `_build_state_floor_reply()` using life-state cues, used only when state answer is too weak/off-topic.
+- Extended `_enforce_reply_budget(...)` with `state_floor_reply`.
+
+2. `nanobot/agent/context.py`
+- Added high-priority rule: self-status answers cannot be vague acknowledgements only; first sentence must directly answer status.
+- Added `get_life_state_cues()` for lightweight `location/activity/mood` extraction.
+
+### Verification
+- `python -m py_compile nanobot/agent/loop.py nanobot/agent/context.py` passed.
+- Expected runtime effect:
+  - `你在干什么啊` should no longer collapse to `嗯`
+  - `告诉我你在干什么` should no longer collapse to `知道啊`
+  - all categories now pass through AI before budget/relevance guards.
+### Tenth refinement minor cleanup (2026-03-14)
+- Removed dead whitelist-style helper artifacts from `nanobot/agent/loop.py`:
+  - `_shape_knowledge_probe_reply`
+  - `_shape_weak_input_reply`
+  - `_shape_social_ping_reply`
+  - `_persist_short_reply`
+  - unused constants `_WEAK_INPUT_REPLIES`, `_STATUS_QUERY_HINTS`, `_SOCIAL_PING_HINTS`
+- This does not change policy, but removes leftover code that looked like branch-by-phrase hardcoding.
+- Re-verified compile: `python -m py_compile nanobot/agent/loop.py nanobot/agent/context.py` passed.
+## Eleventh refinement append (2026-03-14): relationship-aware intent probe fallback
+### Audit conclusion (before patch)
+- Unknown-purpose inputs had no dedicated strategy category; they were mostly `ping/social` and still went through normal LLM generation.
+- This allowed assistant-style offer text (`我能怎么帮助你`) to leak into casual turns.
+- Internal fallback suppression existed, but suppression returned `None` (silent), not relationship-aware接话.
+- Relationship fields (`intimacy/trust/stage`) existed in `RELATIONSHIP.json` prompt injection, but were not exposed to policy logic.
+
+### Changes
+1. `nanobot/agent/loop.py`
+- Added new policy category: `intent_probe` in `_classify_input_intensity(...)`.
+  - Trigger by weak/opening/ambiguous low-semantic signals using lightweight features.
+  - Priority boundaries kept: `state > task > explicit social > intent_probe`.
+  - Presence pings (`在吗/在不在`) are treated as probe-like ambiguous intent, not state.
+- Added relationship-aware probe generator:
+  - `_relationship_probe_tier()` from relationship cues.
+  - `_build_intent_probe_reply(user_text)` with low/mid/high candidate pools and rotation (`_intent_probe_counter`).
+- Added assistant-offer detector `_is_assistant_offer_style(...)`.
+- Extended reply budgeter:
+  - added `intent_probe` budget (1 sentence, short, punctuation stripped).
+  - if LLM output looks service-style or too weak, force relationship-aware probe floor reply.
+- Internal fallback guard enhancement in `_process_message(...)`:
+  - when category is `intent_probe`, fallback no longer goes silent.
+  - emits safe short probe reply instead of externalizing internal placeholder/silence.
+
+2. `nanobot/agent/context.py`
+- Added companion rule line for unclear intent -> short natural relationship-aware probe.
+- Added `get_relationship_cues()` to expose `stage/intimacy/trust` to policy layer.
+
+### Verification
+- `python -m py_compile nanobot/agent/loop.py nanobot/agent/context.py` passed.
+- No new dependencies introduced.

@@ -122,6 +122,8 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 - For greetings and self-status questions, reply naturally first in 1-2 short spoken sentences.
 - For self-status questions (for example: 你在干什么 / 干嘛呢 / 在吗), prefer two-sentence shape:
   first sentence very short status, second sentence a light casual tail.
+- For self-status questions, do not answer with vague acknowledgements only (e.g., `嗯`, `在呢`, `怎么了`).
+  The first sentence must directly answer current status.
 - For knowledge-probe questions (for example: `你知道...吗` / `你懂...吗` / `这个你会吗`), default to a very short acknowledgment only.
 - Do not start explanation/teaching mode unless the user explicitly asks with words like `讲`, `讲讲`, `详细讲`, `展开说`, `解释一下`.
 - Do not proactively report runtime metadata (time, channel, chat id) unless the user asks.
@@ -129,6 +131,9 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 - Ask at most one short follow-up question in casual turns.
 - For weak/emoji/placeholder input, reply with an ultra-short casual acknowledgment only.
 - For weak/emoji/placeholder input, do not invent recent events, current-life details, or long follow-up questions.
+- When user intent is unclear, use one short natural probe (relationship-aware) instead of service-style offers.
+- Match reply budget to input intensity: low-info ping -> ultra short; social/state -> short 1-2 lines; task -> short acknowledgment by default.
+- Any concrete life detail must be evidence-grounded (LIFESTATE/LIFELOG/current dialogue). If not grounded, keep it simple.
 """
 
     @staticmethod
@@ -293,6 +298,35 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
     def has_recent_life_event(self) -> bool:
         """Whether LIFELOG has a grounded recent event."""
         return self._load_recent_life_event() is not None
+
+    def get_life_state_cues(self) -> dict[str, str]:
+        """Return lightweight life-state cues for response guardrails."""
+        life_state = self._load_json_file(self.workspace / "LIFESTATE.json")
+        if not life_state:
+            return {}
+        cues: dict[str, str] = {}
+        for key in ("location", "activity", "mood"):
+            value = self._as_text(life_state.get(key))
+            if value:
+                cues[key] = value
+        return cues
+
+    def get_relationship_cues(self) -> dict[str, Any]:
+        """Return lightweight relationship cues for reply guardrails."""
+        relationship = self._load_json_file(self.workspace / "RELATIONSHIP.json")
+        if not relationship:
+            return {}
+        cues: dict[str, Any] = {}
+        stage = self._as_text(relationship.get("stage"))
+        if stage:
+            cues["stage"] = stage
+        intimacy = self._as_number(relationship.get("intimacy"))
+        if intimacy is not None:
+            cues["intimacy"] = intimacy
+        trust = self._as_number(relationship.get("trust"))
+        if trust is not None:
+            cues["trust"] = trust
+        return cues
 
     def _load_json_file(self, path: Path) -> dict[str, Any] | None:
         """Safely read JSON object from file."""
