@@ -305,10 +305,13 @@ class AgentLoop:
         """Route user query into answer slot for evidence-aware reply policy."""
         raw = (text or "").strip()
         _, flat = cls._normalize_user_text(raw)
-        flat_lower = flat.lower()
         if not flat:
             return "unknown"
 
+        if cls._is_greeting_input(raw):
+            return "greeting"
+        if cls._is_ack_social_followup(raw):
+            return "ack_social_followup"
         if cls._is_meta_self_query(raw):
             return "meta_self"
 
@@ -331,6 +334,36 @@ class AgentLoop:
         if asks_activity or category == "state":
             return "current_activity"
         return "unknown"
+
+    @classmethod
+    def _is_greeting_input(cls, text: str) -> bool:
+        """Detect short greeting openings that should not read state."""
+        _, flat = cls._normalize_user_text(text or "")
+        if not flat:
+            return False
+        flat_lower = flat.lower()
+        if re.fullmatch(r"(hi+|hello+|hey+|yo+)", flat_lower):
+            return True
+        return bool(re.fullmatch(r"(嗨|你好|哈喽|hello|hi|hey|在吗|在不在)", flat, flags=re.IGNORECASE))
+
+    @classmethod
+    def _is_ack_social_followup(cls, text: str) -> bool:
+        """Detect low-information social follow-ups (ack turns)."""
+        raw = (text or "").strip()
+        _, flat = cls._normalize_user_text(raw)
+        if not flat:
+            return False
+        if cls._is_greeting_input(raw):
+            return False
+        if re.search(r"[?？]", raw):
+            return False
+        if len(flat) > 8:
+            return False
+        if cls._is_weak_input(raw):
+            return True
+        if bool(re.fullmatch(r"(我也(是)?|我也是|嗯嗯|嗯|对啊|对呀|是啊|哈哈|哈|好吧|行吧|好哦|也是)", flat)):
+            return True
+        return bool(re.fullmatch(r"(嗯|哦|啊|哈|是|对){1,4}", flat))
 
     @classmethod
     def _is_meta_self_query(cls, text: str) -> bool:
@@ -364,6 +397,27 @@ class AgentLoop:
         idx = (seed + self._intent_probe_counter) % len(pool)
         self._intent_probe_counter = (self._intent_probe_counter + 1) % 10_000
         return pool[idx]
+
+    def _build_greeting_reply(self, user_text: str) -> str:
+        """Short greeting reply that does not use life-state details."""
+        pool = ("嗨", "在呢", "来啦", "哈喽", "你好呀")
+        base = re.sub(r"\s+", "", self._strip_weak_input_markup(user_text))
+        seed = sum(ord(ch) for ch in (base or user_text or "0"))
+        idx = (seed + self._intent_probe_counter) % len(pool)
+        self._intent_probe_counter = (self._intent_probe_counter + 1) % 10_000
+        return pool[idx]
+
+    def _build_ack_followup_reply(self, user_text: str) -> str:
+        """Short social continuation that avoids parrot echo."""
+        pool = ("嗯嗯", "对呀", "哈哈", "我懂", "是呀")
+        base = re.sub(r"\s+", "", self._strip_weak_input_markup(user_text))
+        seed = sum(ord(ch) for ch in (base or user_text or "0"))
+        idx = (seed + self._intent_probe_counter) % len(pool)
+        self._intent_probe_counter = (self._intent_probe_counter + 1) % 10_000
+        candidate = pool[idx]
+        if re.sub(r"\s+", "", candidate) == base:
+            candidate = pool[(idx + 1) % len(pool)]
+        return candidate
 
     @classmethod
     def _is_status_query(cls, text: str) -> bool:
@@ -583,6 +637,12 @@ class AgentLoop:
         recent_events: list[str],
     ) -> str | None:
         """Build evidence-grounded floor reply for each answer slot."""
+        if answer_slot == "greeting":
+            return self._build_greeting_reply(user_text)
+
+        if answer_slot == "ack_social_followup":
+            return self._build_ack_followup_reply(user_text)
+
         if answer_slot == "meta_self":
             return self._build_meta_self_floor_reply(user_text)
 
@@ -605,9 +665,6 @@ class AgentLoop:
                 if len(compact) > 12:
                     return compact[:12]
                 return compact
-            stripped = re.sub(r"\s+", "", self._strip_weak_input_markup(user_text))
-            if bool(re.search(r"(吃了没|吃了吗|饭吃了没)", stripped)):
-                return "吃过了"
             return "就普通吃的"
 
         if answer_slot == "mood":
@@ -638,7 +695,7 @@ class AgentLoop:
         """Avoid repeated same-slot semantic loops across recent turns."""
         if not reply:
             return reply
-        if answer_slot not in {"current_activity", "previous_activity", "meal", "availability", "mood"}:
+        if answer_slot not in {"current_activity", "previous_activity", "meal", "availability", "mood", "greeting", "ack_social_followup"}:
             return reply
 
         history = self._recent_slot_replies.get(session_key, [])
@@ -676,6 +733,8 @@ class AgentLoop:
             "meal": ("就普通吃的", "就简单吃了"),
             "availability": ("刚停下来", "现在能聊"),
             "mood": ("就还行", "还行吧"),
+            "greeting": ("嗨", "在呢", "来啦"),
+            "ack_social_followup": ("嗯嗯", "对呀", "哈哈"),
         }
         pool = pools.get(answer_slot)
         if not pool:
@@ -968,6 +1027,20 @@ class AgentLoop:
             return reply
         return slot_floor_reply or reply
 
+    @staticmethod
+    def _is_rule_first_slot(answer_slot: str) -> bool:
+        """Whether this slot should bypass LLM and answer from rule/evidence first."""
+        return answer_slot in {
+            "greeting",
+            "current_activity",
+            "previous_activity",
+            "meal",
+            "mood",
+            "availability",
+            "ack_social_followup",
+            "meta_self",
+        }
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -1210,7 +1283,8 @@ class AgentLoop:
             recent_events,
         )
 
-        if answer_slot == "meta_self" and not allow_meta_technical:
+        # Slot-first, rule-first: explicit slots bypass free LLM generation by default.
+        if self._is_rule_first_slot(answer_slot) and not (answer_slot == "meta_self" and allow_meta_technical):
             final_content = self._enforce_slot_answer(
                 answer_slot,
                 slot_floor_reply,
@@ -1234,6 +1308,8 @@ class AgentLoop:
             self._record_reply_signature(key, answer_slot, final_content)
             self.sessions.save(session)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+            preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
+            logger.info("Rule-first response to {}:{}: {}", msg.channel, msg.sender_id, preview)
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id, content=final_content,
                 metadata=msg.metadata or {},

@@ -97,3 +97,26 @@
   - current activity question uses current-state path
   - previous activity / meal / mood pull slot-specific floor from recent events or mood cues
   - meta-self default question no longer returns technical stack details
+
+## 17:46 Directional correction (slot-first, rule-first, LLM-last)
+- Updated `nanobot/agent/loop.py`:
+  - Added two new slots and detectors:
+    - `greeting` (hi/hello/你好/嗨 style opening)
+    - `ack_social_followup` (我也是/嗯嗯/对啊/哈哈 style follow-up)
+  - Added rule-only reply builders:
+    - greeting reply (never reads state)
+    - ack follow-up reply (never parrots input)
+  - Converted explicit slots to rule-first short-circuit in `_process_message`:
+    - greeting/current_activity/previous_activity/meal/mood/availability/ack_social_followup/meta_self
+    - exception: `meta_self` with explicit debug mode still allows technical path
+  - Ensured meal fallback remains neutral (`就普通吃的`) when no meal event evidence.
+
+## 17:48 Additional validation
+- `python -m py_compile` passed for:
+  - `nanobot/agent/loop.py`
+  - `tests/test_loop_answer_slot_policy.py`
+- Local venv sanity run confirmed:
+  - `hi` -> rule-first short reply, no LLM call
+  - `你午饭吃的什么` -> meal slot reply, no state phrase bleed
+  - `我也是` -> non-echo social follow-up, no LLM call
+  - `你是用什么写的` -> persona meta-self reply, no LLM call (default mode)
