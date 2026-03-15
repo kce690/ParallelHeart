@@ -94,6 +94,7 @@ class AgentLoop:
         r"你想让我[^。！？!?]{0,20}还是[^。！？!?]{0,20}",
         r"你想我[^。！？!?]{0,20}还是[^。！？!?]{0,20}",
     )
+    _STATE_COMMITMENT_TTL = timedelta(minutes=12)
 
     def __init__(
         self,
@@ -151,6 +152,7 @@ class AgentLoop:
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._recent_slot_replies: dict[str, list[dict[str, str]]] = {}
+        self._recent_state_commitments: dict[str, dict[str, Any]] = {}
         self._processing_lock = asyncio.Lock()
         self.memory_consolidator = MemoryConsolidator(
             workspace=workspace,
@@ -241,6 +243,20 @@ class AgentLoop:
         return stripped, flat
 
     @classmethod
+    def _is_related_state_followup(cls, text: str) -> bool:
+        """Detect follow-up self-status questions that should stay on state chain."""
+        _, flat = cls._normalize_user_text(text or "")
+        if not flat:
+            return False
+        patterns = (
+            r"(这么[晚早].{0,6}(还|在|忙|上课|学习|工作))",
+            r"((上课|学习|工作|开会|忙).{0,6}(到几点|到几时|到什么时候|多久|啥时候(结束|完)))",
+            r"(还在(上课|学习|忙|工作|开会|弄))",
+            r"((忙|上课|学习|工作).{0,6}(完了没|结束没|还吗))",
+        )
+        return any(bool(re.search(pattern, flat)) for pattern in patterns)
+
+    @classmethod
     def _classify_input_intensity(cls, text: str) -> str:
         """Classify incoming user text into ping/social/state/task/intent_probe."""
         raw = (text or "").strip()
@@ -272,6 +288,7 @@ class AgentLoop:
                 flat,
             )
         ) and not presence_ping
+        state_followup_signal = cls._is_related_state_followup(flat)
         social_signal = explicit_social_signal
         task_signal = (
             cls._is_knowledge_probe(raw)
@@ -280,7 +297,7 @@ class AgentLoop:
         )
 
         # state is higher priority for self-status queries.
-        if state_signal:
+        if state_signal or state_followup_signal:
             return "state"
 
         if task_signal:
@@ -332,6 +349,7 @@ class AgentLoop:
 
         has_time_back_ref = bool(re.search(r"(刚才|刚刚|之前|方才|前面|上一会|刚那会)", flat))
         asks_activity = bool(re.search(r"(在干|在做|忙什么|做什么|在忙|在哪|在干嘛|在干啥)", flat))
+        related_state_followup = cls._is_related_state_followup(flat)
         asks_meal = bool(re.search(r"(吃饭|午饭|晚饭|早饭|早餐|吃了没|吃了吗|吃的什么|饭吃了没)", flat))
         asks_mood = bool(re.search(r"(心情|开心|难受|烦|情绪|状态怎么样|是不是不开心)", flat))
         asks_availability = bool(re.search(r"(方便吗|有空吗|能聊吗|是不是刚忙完|忙完了没|现在忙吗)", flat))
@@ -346,6 +364,8 @@ class AgentLoop:
             return "previous_activity"
         if has_time_back_ref and category == "state":
             return "previous_activity"
+        if related_state_followup:
+            return "current_activity"
         if asks_activity or category == "state":
             return "current_activity"
         return "unknown"
@@ -594,9 +614,236 @@ class AgentLoop:
             "知道", "知道啊", "会一点",
         }
 
-    def _build_state_floor_reply(self) -> str:
-        """Build a coarse safe fallback for current-activity slot."""
-        return "在上课呢"
+    def _build_state_floor_reply(
+        self,
+        *,
+        user_text: str = "",
+        snapshot: dict[str, Any] | None = None,
+    ) -> str:
+        """Build a coarse, non-scene fallback when current evidence is insufficient."""
+        snap = snapshot or {}
+        busy = snap.get("busy_level")
+        urgency = snap.get("urgency_bias")
+        activity = str(snap.get("activity") or "")
+        user_flat = re.sub(r"\s+", "", user_text or "")
+
+        if isinstance(busy, (int, float)) and busy >= 75:
+            return "这会儿有点事"
+        if isinstance(urgency, (int, float)) and urgency >= 75:
+            return "在忙点事"
+        if re.search(r"(忙|开会|学习|上课|工作|通勤)", activity):
+            return "在忙点事"
+        if re.search(r"(这么晚|到几点|多久|还)", user_flat):
+            return "刚在弄点东西"
+        return "这会儿有点事"
+
+    @staticmethod
+    def _state_evidence_rank(source: str) -> int:
+        ranks = {
+            "recent_event": 4,
+            "memory_detail": 3,
+            "snapshot_activity": 2,
+            "memory_gist": 2,
+            "coarse_state": 1,
+            "commitment": 1,
+            "uncertain": 0,
+        }
+        return ranks.get(source, 0)
+
+    @staticmethod
+    def _normalize_state_fact(text: str) -> str:
+        compact = re.sub(r"[\s，,。！？!?~～…]", "", text or "")
+        compact = re.sub(r"^(更正下|刚才我说得不准|我刚说得不准)", "", compact)
+        compact = re.sub(r"(这会儿|现在|刚在|正在|有点|呢|呀|啦|吧)$", "", compact)
+        return compact[:18]
+
+    def _get_recent_state_commitment(self, session_key: str) -> dict[str, Any] | None:
+        entry = self._recent_state_commitments.get(session_key)
+        if not entry:
+            return None
+        expires_at = entry.get("expires_at")
+        if isinstance(expires_at, datetime) and datetime.now() > expires_at:
+            self._recent_state_commitments.pop(session_key, None)
+            return None
+        return entry
+
+    def _record_state_commitment(
+        self,
+        *,
+        session_key: str,
+        answer_slot: str,
+        resolved_state: dict[str, Any] | None,
+        final_reply: str | None,
+    ) -> None:
+        if answer_slot not in {"current_activity", "availability"}:
+            return
+        state = resolved_state or {}
+        fact = str(state.get("fact") or final_reply or "").strip()
+        reply = str(final_reply or state.get("reply") or "").strip()
+        if not fact or not reply:
+            return
+        source = str(state.get("source") or "commitment")
+        self._recent_state_commitments[session_key] = {
+            "slot": "current_activity",
+            "fact": fact,
+            "reply": reply,
+            "source": source,
+            "rank": max(self._state_evidence_rank(source), int(state.get("rank") or 0)),
+            "uncertain": bool(state.get("uncertain", False)),
+            "updated_at": datetime.now(),
+            "expires_at": datetime.now() + self._STATE_COMMITMENT_TTL,
+        }
+
+    @staticmethod
+    def _looks_like_ongoing_activity(text: str) -> bool:
+        compact = re.sub(r"\s+", "", text or "")
+        if not compact:
+            return False
+        ongoing = bool(re.search(r"(在|正在|忙|上课|学习|工作|开会|通勤|路上|处理|写|赶|弄)", compact))
+        past = bool(re.search(r"(刚|刚刚|刚才|已经|完了|结束|停下来|吃完|回到)", compact))
+        return ongoing and not past
+
+    def _snapshot_activity_reply(self, snapshot: dict[str, Any]) -> str | None:
+        activity = re.sub(r"\s+", "", str(snapshot.get("activity") or ""))
+        if not activity:
+            return None
+        if re.search(r"(上课|学习|复习|备考)", activity):
+            return "在忙学习的事"
+        if re.search(r"(通勤|路上|地铁|公交|开车)", activity):
+            return "在路上"
+        if re.search(r"(开会|会议)", activity):
+            return "在忙点事"
+        if re.search(r"(工作|办公|写代码|开发|处理|整理|任务|项目)", activity):
+            return "在忙点事"
+        if re.search(r"(休息|放松|躺|睡|歇)", activity):
+            return "这会儿在休整"
+        if re.search(r"(吃|饭)", activity):
+            return "在弄吃的"
+        compact = self._compact_memory_reply(activity, max_chars=8)
+        if not compact:
+            return None
+        if compact.startswith(("在", "正")):
+            return compact
+        return f"在忙{compact}"
+
+    def _resolve_current_activity_state(
+        self,
+        *,
+        session_key: str,
+        user_text: str,
+        snapshot: dict[str, Any],
+        recent_events: list[str],
+        memory_evidence: list[dict[str, Any]] | None = None,
+        memory_recall_level: str = "none",
+        prefer_recent_commitment: bool = False,
+    ) -> dict[str, Any]:
+        latest = self._extract_latest_event(recent_events)
+        if latest:
+            text = self._compact_memory_reply(str(latest), max_chars=14)
+            if text and self._looks_like_ongoing_activity(text):
+                candidate = {
+                    "reply": text,
+                    "fact": text,
+                    "source": "recent_event",
+                    "rank": self._state_evidence_rank("recent_event"),
+                    "uncertain": False,
+                }
+            else:
+                candidate = None
+        else:
+            candidate = None
+
+        if candidate is None:
+            detail = self._pick_memory_evidence(memory_evidence, recall_level="detail")
+            if detail:
+                text = self._compact_memory_reply(str(detail.get("text") or ""), max_chars=14)
+                if text and self._looks_like_ongoing_activity(text):
+                    candidate = {
+                        "reply": text,
+                        "fact": text,
+                        "source": "memory_detail",
+                        "rank": self._state_evidence_rank("memory_detail"),
+                        "uncertain": False,
+                    }
+
+        if candidate is None:
+            snapshot_reply = self._snapshot_activity_reply(snapshot)
+            if snapshot_reply:
+                candidate = {
+                    "reply": snapshot_reply,
+                    "fact": snapshot_reply,
+                    "source": "snapshot_activity",
+                    "rank": self._state_evidence_rank("snapshot_activity"),
+                    "uncertain": False,
+                }
+
+        if candidate is None and memory_recall_level == "gist":
+            gist = self._pick_memory_evidence(memory_evidence, recall_level="gist")
+            if gist:
+                text = self._compact_memory_reply(str(gist.get("gist_summary") or gist.get("text") or ""), max_chars=10)
+                if text:
+                    reply = text if text.startswith("在") else f"大概在{text}"
+                    candidate = {
+                        "reply": reply,
+                        "fact": reply,
+                        "source": "memory_gist",
+                        "rank": self._state_evidence_rank("memory_gist"),
+                        "uncertain": False,
+                    }
+
+        if candidate is None:
+            coarse = self._build_state_floor_reply(user_text=user_text, snapshot=snapshot)
+            candidate = {
+                "reply": coarse,
+                "fact": coarse,
+                "source": "uncertain",
+                "rank": self._state_evidence_rank("uncertain"),
+                "uncertain": True,
+            }
+
+        commitment = self._get_recent_state_commitment(session_key)
+        if not commitment:
+            return candidate
+        if str(commitment.get("slot") or "") != "current_activity":
+            return candidate
+
+        commit_fact = str(commitment.get("fact") or commitment.get("reply") or "")
+        commit_reply = str(commitment.get("reply") or commit_fact)
+        commit_rank = int(commitment.get("rank") or 0)
+        same_fact = self._normalize_state_fact(commit_fact) == self._normalize_state_fact(str(candidate.get("fact") or ""))
+        if same_fact:
+            if commit_rank >= int(candidate.get("rank") or 0):
+                return {
+                    "reply": commit_reply,
+                    "fact": commit_fact or candidate["fact"],
+                    "source": "commitment",
+                    "rank": commit_rank,
+                    "uncertain": bool(commitment.get("uncertain", False)),
+                }
+            return candidate
+
+        if prefer_recent_commitment and commit_rank >= int(candidate.get("rank") or 0):
+            return {
+                "reply": commit_reply,
+                "fact": commit_fact,
+                "source": "commitment",
+                "rank": commit_rank,
+                "uncertain": bool(commitment.get("uncertain", False)),
+            }
+
+        if int(candidate.get("rank") or 0) > commit_rank:
+            updated = dict(candidate)
+            updated["reply"] = f"更正下，{candidate['reply']}"
+            updated["corrected"] = True
+            return updated
+
+        return {
+            "reply": commit_reply,
+            "fact": commit_fact,
+            "source": "commitment",
+            "rank": commit_rank,
+            "uncertain": bool(commitment.get("uncertain", False)),
+        }
 
     @staticmethod
     def _extract_latest_event(events: list[str]) -> str | None:
@@ -675,6 +922,10 @@ class AgentLoop:
         recent_events: list[str],
         memory_evidence: list[dict[str, Any]] | None = None,
         memory_recall_level: str = "none",
+        *,
+        session_key: str = "",
+        related_state_followup: bool = False,
+        current_activity_state: dict[str, Any] | None = None,
     ) -> str | None:
         """Build evidence-grounded floor reply for each answer slot."""
         if answer_slot == "greeting":
@@ -684,7 +935,16 @@ class AgentLoop:
             return self._build_meta_self_floor_reply(user_text)
 
         if answer_slot == "current_activity":
-            return self._build_state_floor_reply()
+            state = current_activity_state or self._resolve_current_activity_state(
+                session_key=session_key,
+                user_text=user_text,
+                snapshot=snapshot,
+                recent_events=recent_events,
+                memory_evidence=memory_evidence,
+                memory_recall_level=memory_recall_level,
+                prefer_recent_commitment=related_state_followup,
+            )
+            return str(state.get("reply") or self._build_state_floor_reply(user_text=user_text, snapshot=snapshot))
 
         if answer_slot == "previous_activity":
             latest = self._extract_latest_event(recent_events)
@@ -728,6 +988,11 @@ class AgentLoop:
             return self._mood_floor(snapshot)
 
         if answer_slot == "availability":
+            if current_activity_state and not bool(current_activity_state.get("uncertain")):
+                fact = str(current_activity_state.get("fact") or "")
+                if re.search(r"(休整|休息|缓一缓)", fact):
+                    return "这会儿能聊"
+                return "还在忙呢"
             latest = self._extract_latest_event(recent_events)
             if latest and re.search(r"(刚|停|歇|回到|忙完)", latest):
                 return "刚停下来"
@@ -752,7 +1017,7 @@ class AgentLoop:
         """Avoid repeated same-slot semantic loops across recent turns."""
         if not reply:
             return reply
-        if answer_slot not in {"current_activity", "previous_activity", "meal", "availability", "mood", "greeting"}:
+        if answer_slot not in {"previous_activity", "meal", "availability", "mood", "greeting", "current_activity"}:
             return reply
 
         history = self._recent_slot_replies.get(session_key, [])
@@ -770,6 +1035,9 @@ class AgentLoop:
         if not repeated:
             return reply
 
+        if answer_slot == "current_activity":
+            return slot_floor_reply or reply
+
         if slot_floor_reply and self._normalize_reply_signature(slot_floor_reply) != last_sig:
             return slot_floor_reply
 
@@ -785,7 +1053,6 @@ class AgentLoop:
     def _anti_repeat_variant(self, answer_slot: str) -> str | None:
         """Return short variant when same-slot semantics repeat."""
         pools: dict[str, tuple[str, ...]] = {
-            "current_activity": ("这会儿就这样", "刚停下来", "嗯就那样"),
             "previous_activity": ("就刚才那样", "刚那会儿"),
             "meal": ("就普通吃的", "就简单吃了"),
             "availability": ("刚停下来", "现在能聊"),
@@ -1221,7 +1488,7 @@ class AgentLoop:
         if category == "state" and answer_slot in {"current_activity", "availability"} and (
             compact_len < min_chars or cls._is_low_information_state_reply(joined)
         ):
-            joined = (state_floor_reply or "这会儿歇着呢").strip()
+            joined = (state_floor_reply or "这会儿有点事").strip()
         elif category == "low_info" and (
             compact_len < min_chars
             or cls._is_assistant_offer_style(joined)
@@ -1255,7 +1522,7 @@ class AgentLoop:
             if category == "intent_probe":
                 return intent_probe_floor_reply or "怎么了"
             if category == "state":
-                return "在家休息呢"
+                return (state_floor_reply or "这会儿有点事").strip()
             if category == "task_debug":
                 return "你具体想查哪块"
             return cls._short_task_ack(user_text)
@@ -1356,7 +1623,7 @@ class AgentLoop:
         if not text:
             return False
         if answer_slot == "current_activity":
-            return bool(re.search(r"(在|忙|歇|外面|在家|路上|休息|学习|通勤)", text))
+            return bool(re.search(r"(在|忙|歇|外面|在家|路上|休息|学习|通勤|有点事|弄点东西|更正下)", text))
         if answer_slot == "previous_activity":
             return bool(re.search(r"(刚|刚才|之前|方才|刚刚)", text))
         if answer_slot == "meal":
@@ -1383,6 +1650,9 @@ class AgentLoop:
             return slot_floor_reply or "你问这个干嘛"
         if not reply:
             return slot_floor_reply or reply
+        if answer_slot in {"current_activity", "availability"} and slot_floor_reply:
+            if cls._normalize_reply_signature(reply) != cls._normalize_reply_signature(slot_floor_reply):
+                return slot_floor_reply
         if answer_slot in {"unknown", "meta_self"}:
             return reply
         if cls._slot_reply_matches(answer_slot, reply):
@@ -1673,6 +1943,14 @@ class AgentLoop:
 
         category = self._classify_input_intensity(msg.content)
         answer_slot = self._route_answer_slot(msg.content, category)
+        related_state_followup = bool(
+            self._get_recent_state_commitment(key)
+            and self._is_related_state_followup(msg.content)
+        )
+        if related_state_followup:
+            category = "state"
+            if answer_slot == "unknown":
+                answer_slot = "current_activity"
         low_info_strategy = bool(
             self._is_low_info_turn(msg.content)
             and answer_slot == "unknown"
@@ -1719,7 +1997,17 @@ class AgentLoop:
             memory_payload=memory_payload,
             answer_slot=answer_slot,
         )
-        state_floor_reply = self._build_state_floor_reply() if category == "state" else None
+        current_activity_state: dict[str, Any] | None = None
+        if answer_slot in {"current_activity", "availability"}:
+            current_activity_state = self._resolve_current_activity_state(
+                session_key=key,
+                user_text=msg.content,
+                snapshot=state_snapshot,
+                recent_events=recent_events,
+                memory_evidence=memory_evidence,
+                memory_recall_level=memory_recall_level,
+                prefer_recent_commitment=related_state_followup,
+            )
         intent_probe_floor_reply = self._build_intent_probe_reply(msg.content) if category == "intent_probe" else None
         low_info_floor_reply = (
             self._build_low_info_probe_reply(
@@ -1738,6 +2026,14 @@ class AgentLoop:
             recent_events,
             memory_evidence,
             memory_recall_level,
+            session_key=key,
+            related_state_followup=related_state_followup,
+            current_activity_state=current_activity_state,
+        )
+        state_floor_reply = (
+            slot_floor_reply
+            if category == "state" and answer_slot in {"current_activity", "availability"}
+            else None
         )
 
         # Slot-first, rule-first: explicit slots bypass free LLM generation by default.
@@ -1763,6 +2059,12 @@ class AgentLoop:
             session.messages.append({"role": "assistant", "content": final_content, "timestamp": datetime.now().isoformat()})
             session.updated_at = datetime.now()
             self._record_reply_signature(key, answer_slot, final_content)
+            self._record_state_commitment(
+                session_key=key,
+                answer_slot=answer_slot,
+                resolved_state=current_activity_state,
+                final_reply=final_content,
+            )
             if self.life_state_service and memory_ids_for_turn:
                 try:
                     await self.life_state_service.reinforce_memory_evidence(memory_ids_for_turn)
@@ -1876,6 +2178,12 @@ class AgentLoop:
                     {"role": "assistant", "content": safe_short, "timestamp": datetime.now().isoformat()}
                 )
                 self._record_reply_signature(key, answer_slot, safe_short)
+                self._record_state_commitment(
+                    session_key=key,
+                    answer_slot=answer_slot,
+                    resolved_state=current_activity_state,
+                    final_reply=safe_short,
+                )
             self.sessions.save(session)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
             if safe_short:
@@ -1888,6 +2196,12 @@ class AgentLoop:
         self._replace_last_assistant_content(all_msgs, final_content)
         self._save_turn(session, all_msgs, 1 + len(history))
         self._record_reply_signature(key, answer_slot, final_content)
+        self._record_state_commitment(
+            session_key=key,
+            answer_slot=answer_slot,
+            resolved_state=current_activity_state,
+            final_reply=final_content,
+        )
         if self.life_state_service and memory_ids_for_turn:
             try:
                 await self.life_state_service.reinforce_memory_evidence(memory_ids_for_turn)

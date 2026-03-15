@@ -1,6 +1,7 @@
 """Tests for answer-slot routing, low-info strategy, and policy guards."""
 
 import inspect
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -36,6 +37,7 @@ def test_route_answer_slot() -> None:
     assert AgentLoop._route_answer_slot("你午饭吃的什么", "state") == "meal"
     assert AgentLoop._route_answer_slot("你心情怎么样", "state") == "mood"
     assert AgentLoop._route_answer_slot("你现在方便吗", "state") == "availability"
+    assert AgentLoop._route_answer_slot("这么晚还上课吗", "state") == "current_activity"
     assert AgentLoop._route_answer_slot("你是用什么写的", "task") == "meta_self"
 
 
@@ -266,13 +268,13 @@ async def test_current_activity_uses_coarse_fallback_not_cue_mapping(tmp_path: P
     )
 
     assert out is not None
-    assert out.content == "在上课呢"
-    assert "外面" not in out.content
+    assert out.content == "在路上"
+    assert "上课" not in out.content
     assert loop.provider.chat_with_retry.await_count == 0
 
 
 @pytest.mark.asyncio
-async def test_state_slot_anti_repeat_changes_second_reply(tmp_path: Path) -> None:
+async def test_state_slot_repeat_keeps_same_state_commitment(tmp_path: Path) -> None:
     loop = _make_loop(tmp_path, LLMResponse(content="在外面待着呢", tool_calls=[]))
 
     out1 = await loop._process_message(
@@ -283,7 +285,71 @@ async def test_state_slot_anti_repeat_changes_second_reply(tmp_path: Path) -> No
     )
 
     assert out1 is not None and out2 is not None
-    assert out1.content != out2.content
+    assert out1.content == out2.content
+
+
+@pytest.mark.asyncio
+async def test_state_related_followups_stay_on_same_source_chain(tmp_path: Path) -> None:
+    (tmp_path / "LIFESTATE.json").write_text(
+        '{"location":"学校","activity":"学习","mood":"平静","energy":70}',
+        encoding="utf-8",
+    )
+    loop = _make_loop(tmp_path, LLMResponse(content="这会儿不走规则", tool_calls=[]))
+
+    out1 = await loop._process_message(
+        InboundMessage(channel="qq", sender_id="u1", chat_id="c1", content="你在干什么")
+    )
+    out2 = await loop._process_message(
+        InboundMessage(channel="qq", sender_id="u1", chat_id="c1", content="这么晚还上课吗")
+    )
+    out3 = await loop._process_message(
+        InboundMessage(channel="qq", sender_id="u1", chat_id="c1", content="你上课上到几点")
+    )
+
+    assert out1 is not None and out2 is not None and out3 is not None
+    assert loop.provider.chat_with_retry.await_count == 0
+    sig1 = AgentLoop._normalize_state_fact(out1.content)
+    assert sig1
+    assert sig1 == AgentLoop._normalize_state_fact(out2.content)
+    assert sig1 == AgentLoop._normalize_state_fact(out3.content)
+
+
+@pytest.mark.asyncio
+async def test_current_activity_without_evidence_uses_vague_non_scene_reply(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path, LLMResponse(content="这条不会用到", tool_calls=[]))
+
+    out = await loop._process_message(
+        InboundMessage(channel="qq", sender_id="u1", chat_id="c1", content="你在干什么")
+    )
+
+    assert out is not None
+    assert "上课" not in out.content
+    assert re.search(r"(有点事|忙点事|弄点东西)", out.content)
+    assert not re.search(r"(学校|教室|通勤|开会)", out.content)
+    assert loop.provider.chat_with_retry.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_state_correction_is_explicit_not_silent(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path, LLMResponse(content="这条不会用到", tool_calls=[]))
+
+    out1 = await loop._process_message(
+        InboundMessage(channel="qq", sender_id="u1", chat_id="c1", content="你在干什么")
+    )
+    assert out1 is not None
+    assert "更正" not in out1.content
+
+    (tmp_path / "LIFESTATE.json").write_text(
+        '{"location":"路上","activity":"通勤","mood":"平静","energy":68}',
+        encoding="utf-8",
+    )
+    out2 = await loop._process_message(
+        InboundMessage(channel="qq", sender_id="u1", chat_id="c1", content="这么晚还上课吗")
+    )
+
+    assert out2 is not None
+    assert "更正" in out2.content
+    assert "上课" not in out2.content
 
 
 @pytest.mark.asyncio
