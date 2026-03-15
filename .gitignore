@@ -1,25 +1,51 @@
+# project private / temp
 .worktrees/
-.assets
-.docs
+.assets/
+.docs/
+
+# env
 .env
-*.pyc
-dist/
-build/
-docs/
-*.egg-info/
-*.egg
-*.pycs
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.py[cod]
 *.pyo
 *.pyd
 *.pyw
 *.pyz
-*.pywz
-*.pyzz
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# virtualenv
 .venv/
 venv/
-__pycache__/
-poetry.lock
+
+# test / coverage / cache
 .pytest_cache/
-botpy.log
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# logs / runtime traces / local notes
+logs/
+*.log
+*.out
+*.err
+*.pid
 nano.*.save
 
+# editor / system
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
