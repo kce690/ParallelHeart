@@ -23,6 +23,7 @@ class MemoryEntry:
     memory_type: str = "life_event"
     gist_summary: str = ""
     detail_text: str = ""
+    trace_summary: str = ""
     importance: float = 0.0
     salience: float = 0.0
     self_relevance: float = 0.0
@@ -35,6 +36,7 @@ class MemoryEntry:
     similarity_cluster_pressure: float = 0.0
     pinned_flag: bool = False
     permanence_tier: str = "normal"
+    decay_profile: str = "default"
     detail_strength: float = 0.0
     gist_strength: float = 0.0
     detail_strength_base: float = 0.0
@@ -64,6 +66,7 @@ class MemoryEntry:
             memory_type=str(data.get("memory_type") or "life_event"),
             gist_summary=str(data.get("gist_summary") or ""),
             detail_text=str(data.get("detail_text") or ""),
+            trace_summary=str(data.get("trace_summary") or ""),
             importance=float(data.get("importance") or 0.0),
             salience=float(data.get("salience") or 0.0),
             self_relevance=float(data.get("self_relevance") or 0.0),
@@ -76,6 +79,7 @@ class MemoryEntry:
             similarity_cluster_pressure=float(data.get("similarity_cluster_pressure") or 0.0),
             pinned_flag=bool(data.get("pinned_flag") or False),
             permanence_tier=str(data.get("permanence_tier") or "normal"),
+            decay_profile=str(data.get("decay_profile") or "default"),
             detail_strength=float(data.get("detail_strength") or 0.0),
             gist_strength=float(data.get("gist_strength") or 0.0),
             detail_strength_base=float(data.get("detail_strength_base") or data.get("detail_strength") or 0.0),

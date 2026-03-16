@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import re
 from datetime import datetime
 from typing import Any
 
@@ -64,6 +65,15 @@ class LifeMemoryEngine:
                 cfg=self.config,
             )
             scored = score_event(raw, self.config, cluster_pressure=pressure)
+            decay_profile = self._resolve_decay_profile(
+                raw=raw,
+                scored_memory_type=scored["memory_type"],
+                pinned_flag=bool(scored["pinned_flag"]),
+            )
+            trace_summary = self._derive_trace_summary(
+                raw=raw,
+                decay_profile=decay_profile,
+            )
 
             event_id = str(raw.get("event_id") or raw.get("id") or "")
             entry = MemoryEntry(
@@ -80,6 +90,7 @@ class LifeMemoryEngine:
                 memory_type=scored["memory_type"],
                 gist_summary=scored["gist_summary"],
                 detail_text=scored["detail_text"],
+                trace_summary=trace_summary,
                 importance=scored["importance"],
                 salience=scored["salience"],
                 self_relevance=scored["self_relevance"],
@@ -92,6 +103,7 @@ class LifeMemoryEngine:
                 similarity_cluster_pressure=scored["similarity_cluster_pressure"],
                 pinned_flag=scored["pinned_flag"],
                 permanence_tier=scored["permanence_tier"],
+                decay_profile=decay_profile,
                 detail_strength=scored["detail_strength"],
                 gist_strength=scored["gist_strength"],
                 detail_strength_base=scored["detail_strength_base"],
@@ -203,6 +215,15 @@ class LifeMemoryEngine:
                     cfg=self.config,
                 )
                 scored = score_event(raw, self.config, cluster_pressure=pressure)
+                decay_profile = self._resolve_decay_profile(
+                    raw=raw,
+                    scored_memory_type=scored["memory_type"],
+                    pinned_flag=bool(scored["pinned_flag"]),
+                )
+                trace_summary = self._derive_trace_summary(
+                    raw=raw,
+                    decay_profile=decay_profile,
+                )
                 event_id = str(raw.get("event_id") or raw.get("id") or "")
                 entries.append(
                     MemoryEntry(
@@ -219,6 +240,7 @@ class LifeMemoryEngine:
                         memory_type=scored["memory_type"],
                         gist_summary=scored["gist_summary"],
                         detail_text=scored["detail_text"],
+                        trace_summary=trace_summary,
                         importance=scored["importance"],
                         salience=scored["salience"],
                         self_relevance=scored["self_relevance"],
@@ -231,6 +253,7 @@ class LifeMemoryEngine:
                         similarity_cluster_pressure=scored["similarity_cluster_pressure"],
                         pinned_flag=scored["pinned_flag"],
                         permanence_tier=scored["permanence_tier"],
+                        decay_profile=decay_profile,
                         detail_strength=scored["detail_strength"],
                         gist_strength=scored["gist_strength"],
                         detail_strength_base=scored["detail_strength_base"],
@@ -256,11 +279,13 @@ class LifeMemoryEngine:
         evidence = self.retrieve(query, now=now, limit=limit)
         detail = [e for e in evidence if e.recall_level == "detail"]
         gist = [e for e in evidence if e.recall_level == "gist"]
+        trace = [e for e in evidence if e.recall_level == "trace"]
 
         lines = [
             "Memory retrieval policy:",
             "- DETAIL evidence may be stated with specifics.",
             "- GIST evidence is coarse only; do not invent missing details.",
+            "- TRACE evidence is very coarse only; do not restore specifics.",
             "- If no evidence is strong enough, say memory is unclear.",
         ]
         if detail:
@@ -271,15 +296,63 @@ class LifeMemoryEngine:
             lines.append("GIST_ONLY evidence:")
             for item in gist[:4]:
                 lines.append(f"- [{item.id}] {item.gist_summary}")
-        if not detail and not gist:
+        if trace:
+            lines.append("TRACE_ONLY evidence:")
+            for item in trace[:4]:
+                lines.append(f"- [{item.id}] {item.text}")
+        if not detail and not gist and not trace:
             lines.append("No reliable long-term memory evidence for this query.")
 
-        recall_level = "detail" if detail else ("gist" if gist else "none")
+        recall_level = "detail" if detail else ("gist" if gist else ("trace" if trace else "none"))
         return {
             "recall_level": recall_level,
             "evidence": [item.to_dict() for item in evidence],
             "prompt_block": "\n".join(lines),
         }
+
+    @staticmethod
+    def _resolve_decay_profile(
+        *,
+        raw: dict[str, Any],
+        scored_memory_type: str,
+        pinned_flag: bool,
+    ) -> str:
+        explicit = str(raw.get("decay_profile") or "").strip().lower()
+        valid = {"meal", "study", "relationship", "anchor", "default"}
+        if explicit in valid:
+            return explicit
+        if pinned_flag:
+            return "anchor"
+
+        text = " ".join(
+            str(raw.get(k) or "")
+            for k in ("type", "summary", "gist", "detail")
+        ).lower()
+        text = f"{text} {str(scored_memory_type or '').lower()}"
+        if re.search(r"(identity|promise|milestone|anchor|身份|承诺|里程碑|锚点)", text):
+            return "anchor"
+        if re.search(r"(relationship|friend|family|partner|关系|朋友|家人|恋人)", text):
+            return "relationship"
+        if re.search(r"(meal|lunch|dinner|breakfast|吃|饭|早餐|午饭|晚饭)", text):
+            return "meal"
+        if re.search(r"(study|class|course|exam|学习|上课|复习|考试)", text):
+            return "study"
+        return "default"
+
+    @staticmethod
+    def _derive_trace_summary(*, raw: dict[str, Any], decay_profile: str) -> str:
+        explicit = str(raw.get("trace_summary") or raw.get("trace") or "").strip()
+        if explicit:
+            return explicit
+        if decay_profile == "meal":
+            return "Had a meal around that time."
+        if decay_profile == "study":
+            return "Spent time on study-related activities."
+        if decay_profile == "relationship":
+            return "Had a relationship-relevant interaction."
+        if decay_profile == "anchor":
+            return "A long-term core milestone was involved."
+        return "A past event happened in that period."
 
     def _load_entries(self) -> list[MemoryEntry]:
         payload = self.store.load_memory_index()

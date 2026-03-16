@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import random
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,22 @@ def _infer_recalled_event_time(summary: str, *, mentioned_at: datetime) -> datet
             return None
 
     return inferred_day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def _infer_recalled_decay_profile(summary: str) -> tuple[str, str]:
+    """Infer coarse remembered-event profile for time-window gating."""
+    text = str(summary or "").strip().lower()
+    if not text:
+        return "default", "default"
+    if re.search(r"(identity|promise|milestone|anchor|身份|承诺|里程碑|锚点)", text):
+        return "anchor", "anchor"
+    if re.search(r"(relationship|friend|family|partner|关系|朋友|家人|恋人)", text):
+        return "relationship", "relationship"
+    if re.search(r"(meal|lunch|dinner|breakfast|吃|饭|早餐|午饭|晚饭)", text):
+        return "meal", "meal"
+    if re.search(r"(study|class|course|exam|学习|上课|复习|考试)", text):
+        return "study", "study"
+    return "default", "default"
 
 
 def _clamp_int(value: Any, low: int, high: int, default: int) -> int:
@@ -868,11 +885,15 @@ class LifeStateService:
             end_dt = start_dt
 
         conf = max(0.0, min(1.0, float(certainty)))
+        decay_profile, recalled_kind = _infer_recalled_decay_profile(text)
+        event_type = "recalled_event" if recalled_kind == "default" else f"recalled_{recalled_kind}"
         payload = {
-            "type": "recalled_event",
+            "type": event_type,
             "summary": text,
             "source": "dialog",
             "source_kind": "dialog_recall",
+            "recalled_kind": recalled_kind,
+            "decay_profile": decay_profile,
             "source_turn": str(source_turn or ""),
             "time": _to_iso(start_dt),  # Backward compatibility for old readers.
             "event_time_start": _to_iso(start_dt),
@@ -887,6 +908,9 @@ class LifeStateService:
             "emotional_weight": 0.25,
             "novelty": 0.4,
         }
+        if decay_profile == "anchor":
+            payload["pinned"] = True
+            payload["core_memory"] = True
 
         async with self._lock:
             self._ensure_prehistory_bootstrap_locked(now=now)

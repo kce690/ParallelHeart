@@ -2,6 +2,7 @@
 
 import inspect
 import re
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -327,6 +328,29 @@ async def test_current_activity_without_evidence_uses_vague_non_scene_reply(tmp_
     assert re.search(r"(有点事|忙点事|弄点东西)", out.content)
     assert not re.search(r"(学校|教室|通勤|开会)", out.content)
     assert loop.provider.chat_with_retry.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_historical_memory_does_not_pollute_current_activity_resolution(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path, LLMResponse(content="杩欐潯涓嶄細鐢ㄥ埌", tool_calls=[]))
+    stale_tick = (datetime.now().astimezone() - timedelta(hours=8)).replace(microsecond=0).isoformat()
+
+    state = loop._resolve_current_activity_state(
+        session_key="qq:c1",
+        user_text="你现在在干嘛",
+        snapshot={"activity": "在学线代", "last_tick": stale_tick},
+        recent_events=[],
+        memory_evidence=[{"recall_level": "detail", "text": "上午9点学线性代数，看到行列式"}],
+        memory_recall_level="detail",
+        prefer_recent_commitment=False,
+    )
+
+    assert state.get("source") == "uncertain"
+    assert "线代" not in str(state.get("reply") or "")
+
+
+def test_memory_recall_level_accepts_trace() -> None:
+    assert AgentLoop._memory_recall_level({"recall_level": "trace"}) == "trace"
 
 
 @pytest.mark.asyncio

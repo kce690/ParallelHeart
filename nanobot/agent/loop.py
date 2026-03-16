@@ -569,6 +569,8 @@ class AgentLoop:
                 return "就普通吃的"
             if memory_recall_level == "gist":
                 return "记得大概吃过"
+            if memory_recall_level == "trace":
+                return "只记得那会儿吃过饭"
             text = re.sub(r"\s+", " ", reply).strip()
             text = re.sub(r"(刚刚?|刚才)?(在)?(外面|家里|学校)?(随便|简单)?吃了[^，。！？!?]{0,24}", "", text).strip(" ，,。！？!?")
             text = re.sub(r"(午饭|晚饭|早饭|早餐)吃了[^，。！？!?]{0,24}", "", text).strip(" ，,。！？!?")
@@ -579,6 +581,8 @@ class AgentLoop:
                 return "有点记不清了"
             if memory_recall_level == "gist":
                 return "只记得个大概"
+            if memory_recall_level == "trace":
+                return "只记得那会儿有安排"
             text = re.sub(r"\s+", " ", reply).strip()
             text = re.sub(r"(刚刚?|刚才|之前)[^，。！？!?]{0,24}", "", text).strip(" ，,。！？!?")
             return text or "刚刚就那样"
@@ -953,6 +957,10 @@ class AgentLoop:
                     text = self._compact_memory_reply(str(gist.get("gist_summary") or gist.get("text") or ""))
                     if text:
                         return f"大概是{text}"
+            if memory_recall_level == "trace":
+                trace = self._pick_memory_evidence(memory_evidence, recall_level="trace")
+                if trace:
+                    return "只记得那会儿有安排"
             if memory_recall_level == "none":
                 return "有点记不清了"
             return "刚刚就那样"
@@ -971,6 +979,8 @@ class AgentLoop:
                     return text
             if memory_recall_level == "gist":
                 return "记得大概吃过"
+            if memory_recall_level == "trace":
+                return "只记得那会儿吃过饭"
             return "就普通吃的"
 
         if answer_slot == "mood":
@@ -1675,7 +1685,7 @@ class AgentLoop:
         if not isinstance(memory_payload, dict):
             return "none"
         level = str(memory_payload.get("recall_level") or "none").strip().lower()
-        return level if level in {"detail", "gist", "none"} else "none"
+        return level if level in {"detail", "gist", "trace", "none"} else "none"
 
     @staticmethod
     def _memory_evidence_items(memory_payload: dict[str, Any] | None) -> list[dict[str, Any]]:

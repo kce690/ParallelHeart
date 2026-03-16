@@ -56,7 +56,7 @@ def test_pinned_memory_remains_available(tmp_path) -> None:
     assert entry.detail_strength >= engine.config.permanence.pinned_detail_floor
     evidence = engine.retrieve("promise", now=far, limit=3)
     assert evidence
-    assert evidence[0].recall_level in {"detail", "gist"}
+    assert evidence[0].recall_level in {"detail", "gist", "trace"}
 
 
 def test_volatile_memory_drops_below_threshold_quickly(tmp_path) -> None:
@@ -134,7 +134,7 @@ def test_gist_survives_after_detail_falls_below_threshold(tmp_path) -> None:
     assert evidence[0].recall_level == "gist"
 
 
-def test_query_time_gate_detail_then_gist_then_none(tmp_path) -> None:
+def test_query_time_gate_detail_then_gist_then_trace_then_none(tmp_path) -> None:
     cfg = MemoryForgettingConfig()
     cfg.decay.lambda_detail = 0.50
     cfg.decay.lambda_gist = 0.20
@@ -146,10 +146,137 @@ def test_query_time_gate_detail_then_gist_then_none(tmp_path) -> None:
     early = engine.retrieve("practice session", now=t0, limit=2)
     mid = engine.retrieve("practice session", now=t0 + timedelta(hours=5), limit=2)
     late = engine.retrieve("practice session", now=t0 + timedelta(hours=20), limit=2)
+    very_late = engine.retrieve("practice session", now=t0 + timedelta(days=40), limit=2)
 
     assert early and early[0].recall_level == "detail"
     assert mid and mid[0].recall_level == "gist"
-    assert late == []
+    assert late and late[0].recall_level == "trace"
+    assert very_late == []
+
+
+def test_study_profile_same_day_detail_then_week_gist(tmp_path) -> None:
+    cfg = MemoryForgettingConfig()
+    cfg.decay.lambda_detail = 0.08
+    cfg.decay.lambda_gist = 0.003
+    cfg.retrieval.T_detail = 0.25
+    cfg.permanence.durable_salience_threshold = 0.99
+    engine = _mk_engine(tmp_path, cfg)
+    t0 = now_local()
+    engine.ingest_event(
+        {
+            "time": to_iso(t0),
+            "event_time_start": to_iso(t0),
+            "summary": "Studied linear algebra at 9am and reviewed determinants",
+            "source": "dialog",
+            "importance": 1.8,
+            "decay_profile": "study",
+            "trace_summary": "Spent time on study-related activities.",
+        }
+    )
+
+    same_day = engine.retrieve("studied linear algebra determinants", now=t0 + timedelta(hours=10), limit=3)
+    one_week = engine.retrieve("studied linear algebra determinants", now=t0 + timedelta(days=6), limit=3)
+
+    assert same_day and same_day[0].recall_level == "detail"
+    assert one_week and one_week[0].recall_level == "gist"
+
+
+def test_meal_profile_event_becomes_forgotten_after_trace_window(tmp_path) -> None:
+    engine = _mk_engine(tmp_path)
+    t0 = now_local()
+    engine.ingest_event(
+        {
+            "time": to_iso(t0),
+            "event_time_start": to_iso(t0),
+            "summary": "中午12点吃了牛肉面",
+            "source": "dialog",
+            "importance": 0.6,
+            "decay_profile": "meal",
+            "trace_summary": "Had a meal around that time.",
+        }
+    )
+
+    far = engine.retrieve("中午吃了什么", now=t0 + timedelta(days=20), limit=3)
+    assert far == []
+
+
+def test_trace_level_does_not_leak_detail_tokens(tmp_path) -> None:
+    cfg = MemoryForgettingConfig()
+    cfg.decay.lambda_detail = 0.08
+    cfg.decay.lambda_gist = 0.003
+    cfg.permanence.durable_salience_threshold = 0.99
+    engine = _mk_engine(tmp_path, cfg)
+    t0 = now_local()
+    engine.ingest_event(
+        {
+            "time": to_iso(t0),
+            "event_time_start": to_iso(t0),
+            "summary": "Studied linear algebra at 9am and reviewed determinants",
+            "source": "dialog",
+            "importance": 1.8,
+            "decay_profile": "study",
+            "trace_summary": "Spent time on study-related activities.",
+        }
+    )
+
+    evidence = engine.retrieve("studied linear algebra determinants", now=t0 + timedelta(days=10), limit=3)
+    assert evidence
+    assert evidence[0].recall_level == "trace"
+    assert "9am" not in evidence[0].text.lower()
+    assert "linear algebra" not in evidence[0].text.lower()
+    assert "determinants" not in evidence[0].text.lower()
+
+
+def test_old_index_entries_without_trace_fields_are_compatible(tmp_path) -> None:
+    engine = _mk_engine(tmp_path)
+    t0 = now_local()
+    engine.store.save_memory_index(
+        {
+            "version": 1,
+            "updated_at": to_iso(t0),
+            "entries": [
+                {
+                    "id": "mem_legacy_1",
+                    "event_ids": ["evt_legacy_1"],
+                    "timestamp_first": to_iso(t0),
+                    "timestamp_last": to_iso(t0),
+                    "event_time_start": to_iso(t0),
+                    "event_time_end": to_iso(t0),
+                    "memory_type": "life_event",
+                    "gist_summary": "General memory: studied in that period.",
+                    "detail_text": "今天上午9点学线性代数，看到行列式",
+                    "importance": 0.8,
+                    "salience": 0.8,
+                    "detail_strength": 0.7,
+                    "gist_strength": 0.8,
+                    "detail_strength_base": 0.7,
+                    "gist_strength_base": 0.8,
+                }
+            ],
+        }
+    )
+
+    evidence = engine.retrieve("上午学了什么", now=t0 + timedelta(days=2), limit=3)
+    payload = engine.build_prompt_evidence("上午学了什么", now=t0 + timedelta(days=2), limit=3)
+
+    assert isinstance(evidence, list)
+    assert isinstance(payload, dict)
+    assert "recall_level" in payload
+
+
+@pytest.mark.asyncio
+async def test_record_recalled_event_sets_decay_profile_and_kind(tmp_path) -> None:
+    service = LifeStateService(tmp_path)
+    t0 = now_local()
+    out = await service.record_recalled_event(
+        summary="中午12点吃了牛肉面",
+        source_turn="turn_x",
+        event_time_start=t0,
+    )
+
+    assert out is not None
+    assert out.get("decay_profile") == "meal"
+    assert out.get("type") == "recalled_meal"
 
 
 @pytest.mark.asyncio
