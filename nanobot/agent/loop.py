@@ -95,6 +95,7 @@ class AgentLoop:
         r"你想我[^。！？!?]{0,20}还是[^。！？!?]{0,20}",
     )
     _STATE_COMMITMENT_TTL = timedelta(minutes=12)
+    _CURRENT_SNAPSHOT_MAX_AGE = timedelta(hours=3)
 
     def __init__(
         self,
@@ -703,6 +704,37 @@ class AgentLoop:
         past = bool(re.search(r"(刚|刚刚|刚才|已经|完了|结束|停下来|吃完|回到)", compact))
         return ongoing and not past
 
+    @classmethod
+    def _is_snapshot_fresh_for_current(cls, snapshot: dict[str, Any]) -> bool:
+        """Only treat recent life snapshot as valid current-state evidence."""
+        last_tick = str(snapshot.get("last_tick") or "").strip()
+        if not last_tick:
+            # Backward compatibility: legacy snapshots may not carry timestamps.
+            return bool(str(snapshot.get("activity") or "").strip())
+        try:
+            parsed = datetime.fromisoformat(last_tick)
+        except Exception:
+            return False
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        age = datetime.now().astimezone() - parsed.astimezone()
+        return timedelta(0) <= age <= cls._CURRENT_SNAPSHOT_MAX_AGE
+
+    @staticmethod
+    def _extract_recalled_event_summary(text: str) -> str | None:
+        """Minimal heuristic: capture user-stated historical event traces."""
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        if re.search(r"[?？]\s*$", raw):
+            return None
+        compact = re.sub(r"\s+", "", raw)
+        has_time_ref = bool(re.search(r"(上午|中午|下午|晚上|昨天|前天|刚才|之前|那会|那天)", compact))
+        has_event = bool(re.search(r"(学|复习|上课|吃|饭|通勤|开会|工作|睡|休息|跑步|运动)", compact))
+        if has_time_ref and has_event:
+            return raw[:120]
+        return None
+
     def _snapshot_activity_reply(self, snapshot: dict[str, Any]) -> str | None:
         activity = re.sub(r"\s+", "", str(snapshot.get("activity") or ""))
         if not activity:
@@ -737,59 +769,16 @@ class AgentLoop:
         memory_recall_level: str = "none",
         prefer_recent_commitment: bool = False,
     ) -> dict[str, Any]:
-        latest = self._extract_latest_event(recent_events)
-        if latest:
-            text = self._compact_memory_reply(str(latest), max_chars=14)
-            if text and self._looks_like_ongoing_activity(text):
-                candidate = {
-                    "reply": text,
-                    "fact": text,
-                    "source": "recent_event",
-                    "rank": self._state_evidence_rank("recent_event"),
-                    "uncertain": False,
-                }
-            else:
-                candidate = None
-        else:
-            candidate = None
-
-        if candidate is None:
-            detail = self._pick_memory_evidence(memory_evidence, recall_level="detail")
-            if detail:
-                text = self._compact_memory_reply(str(detail.get("text") or ""), max_chars=14)
-                if text and self._looks_like_ongoing_activity(text):
-                    candidate = {
-                        "reply": text,
-                        "fact": text,
-                        "source": "memory_detail",
-                        "rank": self._state_evidence_rank("memory_detail"),
-                        "uncertain": False,
-                    }
-
-        if candidate is None:
-            snapshot_reply = self._snapshot_activity_reply(snapshot)
-            if snapshot_reply:
-                candidate = {
-                    "reply": snapshot_reply,
-                    "fact": snapshot_reply,
-                    "source": "snapshot_activity",
-                    "rank": self._state_evidence_rank("snapshot_activity"),
-                    "uncertain": False,
-                }
-
-        if candidate is None and memory_recall_level == "gist":
-            gist = self._pick_memory_evidence(memory_evidence, recall_level="gist")
-            if gist:
-                text = self._compact_memory_reply(str(gist.get("gist_summary") or gist.get("text") or ""), max_chars=10)
-                if text:
-                    reply = text if text.startswith("在") else f"大概在{text}"
-                    candidate = {
-                        "reply": reply,
-                        "fact": reply,
-                        "source": "memory_gist",
-                        "rank": self._state_evidence_rank("memory_gist"),
-                        "uncertain": False,
-                    }
+        candidate = None
+        snapshot_reply = self._snapshot_activity_reply(snapshot)
+        if snapshot_reply and self._is_snapshot_fresh_for_current(snapshot):
+            candidate = {
+                "reply": snapshot_reply,
+                "fact": snapshot_reply,
+                "source": "snapshot_activity",
+                "rank": self._state_evidence_rank("snapshot_activity"),
+                "uncertain": False,
+            }
 
         if candidate is None:
             coarse = self._build_state_floor_reply(user_text=user_text, snapshot=snapshot)
@@ -1974,6 +1963,15 @@ class AgentLoop:
         state_snapshot = self.context.get_life_state_snapshot()
         recent_events = self.context.get_recent_life_events(limit=5)
         has_recent_event = bool(recent_events)
+        recalled_summary = self._extract_recalled_event_summary(msg.content)
+        if self.life_state_service and recalled_summary:
+            try:
+                await self.life_state_service.record_recalled_event(
+                    summary=recalled_summary,
+                    source_turn=str(msg.metadata.get("message_id") or ""),
+                )
+            except Exception:
+                logger.exception("Recalled-event capture failed for {}", key)
         memory_payload: dict[str, Any] | None = None
         if self.life_state_service:
             query_with_context = " | ".join(

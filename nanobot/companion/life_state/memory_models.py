@@ -14,6 +14,12 @@ class MemoryEntry:
     event_ids: list[str] = field(default_factory=list)
     timestamp_first: str = ""
     timestamp_last: str = ""
+    event_time_start: str = ""
+    event_time_end: str = ""
+    mentioned_time: str | None = None
+    stored_time: str = ""
+    source_turn: str = ""
+    source_kind: str = ""
     memory_type: str = "life_event"
     gist_summary: str = ""
     detail_text: str = ""
@@ -34,6 +40,7 @@ class MemoryEntry:
     detail_strength_base: float = 0.0
     gist_strength_base: float = 0.0
     last_recalled_at: str | None = None
+    last_accessed_time: str | None = None
     last_decay_at: str = ""
     decay_overrides: dict[str, float] = field(default_factory=dict)
 
@@ -48,6 +55,12 @@ class MemoryEntry:
             event_ids=[str(x) for x in data.get("event_ids") or []],
             timestamp_first=str(data.get("timestamp_first") or ""),
             timestamp_last=str(data.get("timestamp_last") or ""),
+            event_time_start=str(data.get("event_time_start") or data.get("timestamp_first") or ""),
+            event_time_end=str(data.get("event_time_end") or data.get("timestamp_last") or data.get("timestamp_first") or ""),
+            mentioned_time=data.get("mentioned_time"),
+            stored_time=str(data.get("stored_time") or data.get("timestamp_first") or ""),
+            source_turn=str(data.get("source_turn") or ""),
+            source_kind=str(data.get("source_kind") or data.get("source") or ""),
             memory_type=str(data.get("memory_type") or "life_event"),
             gist_summary=str(data.get("gist_summary") or ""),
             detail_text=str(data.get("detail_text") or ""),
@@ -68,6 +81,7 @@ class MemoryEntry:
             detail_strength_base=float(data.get("detail_strength_base") or data.get("detail_strength") or 0.0),
             gist_strength_base=float(data.get("gist_strength_base") or data.get("gist_strength") or 0.0),
             last_recalled_at=data.get("last_recalled_at"),
+            last_accessed_time=data.get("last_accessed_time"),
             last_decay_at=str(data.get("last_decay_at") or ""),
             decay_overrides=dict(data.get("decay_overrides") or {}),
         )
@@ -91,4 +105,3 @@ class MemoryEvidence:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
-

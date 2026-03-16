@@ -29,7 +29,22 @@ class LifeMemoryStore:
         record = dict(event or {})
         record_id = str(record.get("event_id") or record.get("id") or f"evt_{uuid.uuid4().hex}")
         record["event_id"] = record_id
-        record.setdefault("time", to_iso(now_local()))
+        now_iso = to_iso(now_local())
+        stored_time = str(record.get("stored_time") or "").strip() or now_iso
+        mentioned_time_raw = str(record.get("mentioned_time") or "").strip()
+        mentioned_time = mentioned_time_raw or None
+        event_time_start = str(record.get("event_time_start") or record.get("time") or "").strip()
+        if not event_time_start:
+            event_time_start = mentioned_time or stored_time
+        event_time_end = str(record.get("event_time_end") or "").strip() or event_time_start
+
+        record["event_time_start"] = event_time_start
+        record["event_time_end"] = event_time_end
+        record["mentioned_time"] = mentioned_time
+        record["stored_time"] = stored_time
+        record.setdefault("source_turn", str(record.get("source_turn") or ""))
+        record.setdefault("source_kind", str(record.get("source_kind") or record.get("source") or ""))
+        record.setdefault("time", event_time_start)
         line = json.dumps(record, ensure_ascii=False)
 
         self.raw_event_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -100,4 +115,3 @@ class LifeMemoryStore:
             "updated_at": to_iso(now_local()),
             "entries": [],
         }
-

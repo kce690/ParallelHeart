@@ -43,6 +43,12 @@ class LifeMemoryEngine:
         with self._lock:
             raw = self.store.append_raw_event(event)
             event_time = parse_iso(raw.get("time")) or now_local()
+            event_time_start = str(raw.get("event_time_start") or raw.get("time") or to_iso(event_time))
+            event_time_end = str(raw.get("event_time_end") or event_time_start)
+            mentioned_time = raw.get("mentioned_time")
+            stored_time = str(raw.get("stored_time") or to_iso(event_time))
+            source_turn = str(raw.get("source_turn") or "")
+            source_kind = str(raw.get("source_kind") or raw.get("source") or "")
 
             entries = self._load_entries()
             changed = False
@@ -65,6 +71,12 @@ class LifeMemoryEngine:
                 event_ids=[event_id] if event_id else [],
                 timestamp_first=to_iso(event_time),
                 timestamp_last=to_iso(event_time),
+                event_time_start=event_time_start,
+                event_time_end=event_time_end,
+                mentioned_time=mentioned_time,
+                stored_time=stored_time,
+                source_turn=source_turn,
+                source_kind=source_kind,
                 memory_type=scored["memory_type"],
                 gist_summary=scored["gist_summary"],
                 detail_text=scored["detail_text"],
@@ -85,6 +97,7 @@ class LifeMemoryEngine:
                 detail_strength_base=scored["detail_strength_base"],
                 gist_strength_base=scored["gist_strength_base"],
                 last_recalled_at=None,
+                last_accessed_time=None,
                 last_decay_at=to_iso(event_time),
             )
             entries.append(entry)
@@ -121,15 +134,23 @@ class LifeMemoryEngine:
             for entry in entries:
                 changed = decay_entry(entry, now=target, cfg=self.config) or changed
             recompute_cluster_pressure(entries, now=target, cfg=self.config)
-            if changed:
-                self._save_entries(entries)
-            return retrieve_memories(
+            evidence = retrieve_memories(
                 entries,
                 query=query,
                 now=target,
                 cfg=self.config,
                 limit=limit,
             )
+            stamp = to_iso(target)
+            used_ids = {item.id for item in evidence if item.id}
+            if used_ids:
+                for entry in entries:
+                    if entry.id in used_ids and entry.last_accessed_time != stamp:
+                        entry.last_accessed_time = stamp
+                        changed = True
+            if changed:
+                self._save_entries(entries)
+            return evidence
 
     def reinforce(self, memory_ids: list[str], *, now: datetime | None = None) -> int:
         """Apply retrieval-based strengthening to used memory entries."""
@@ -144,6 +165,7 @@ class LifeMemoryEngine:
                 if entry.id not in id_set:
                     continue
                 reinforce_entry(entry, now=target, cfg=self.config)
+                entry.last_accessed_time = to_iso(target)
                 reinforced += 1
             if reinforced:
                 recompute_cluster_pressure(entries, now=target, cfg=self.config)
@@ -162,6 +184,12 @@ class LifeMemoryEngine:
                 if not summary:
                     continue
                 event_time = parse_iso(raw.get("time")) or now_local()
+                event_time_start = str(raw.get("event_time_start") or raw.get("time") or to_iso(event_time))
+                event_time_end = str(raw.get("event_time_end") or event_time_start)
+                mentioned_time = raw.get("mentioned_time")
+                stored_time = str(raw.get("stored_time") or to_iso(event_time))
+                source_turn = str(raw.get("source_turn") or "")
+                source_kind = str(raw.get("source_kind") or raw.get("source") or "")
 
                 for existing in entries:
                     decay_entry(existing, now=event_time, cfg=self.config)
@@ -182,6 +210,12 @@ class LifeMemoryEngine:
                         event_ids=[event_id] if event_id else [],
                         timestamp_first=to_iso(event_time),
                         timestamp_last=to_iso(event_time),
+                        event_time_start=event_time_start,
+                        event_time_end=event_time_end,
+                        mentioned_time=mentioned_time,
+                        stored_time=stored_time,
+                        source_turn=source_turn,
+                        source_kind=source_kind,
                         memory_type=scored["memory_type"],
                         gist_summary=scored["gist_summary"],
                         detail_text=scored["detail_text"],
@@ -202,6 +236,7 @@ class LifeMemoryEngine:
                         detail_strength_base=scored["detail_strength_base"],
                         gist_strength_base=scored["gist_strength_base"],
                         last_recalled_at=None,
+                        last_accessed_time=None,
                         last_decay_at=to_iso(event_time),
                     )
                 )
@@ -264,4 +299,3 @@ class LifeMemoryEngine:
                 "entry_count": len(entries),
             }
         )
-

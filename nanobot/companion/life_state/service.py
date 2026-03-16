@@ -42,6 +42,51 @@ def _parse_iso(value: Any) -> datetime | None:
     return parsed.astimezone().replace(microsecond=0)
 
 
+def _coerce_datetime(value: Any) -> datetime | None:
+    """Coerce datetime-like input into local aware datetime."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=_now_local().tzinfo)
+        return value.astimezone().replace(microsecond=0)
+    return _parse_iso(value)
+
+
+def _infer_recalled_event_time(summary: str, *, mentioned_at: datetime) -> datetime | None:
+    """Infer coarse historical event time from simple temporal phrases."""
+    text = str(summary or "").strip()
+    if not text:
+        return None
+
+    inferred_day = mentioned_at
+    if "前天" in text:
+        inferred_day = mentioned_at - timedelta(days=2)
+    elif "昨天" in text:
+        inferred_day = mentioned_at - timedelta(days=1)
+
+    hour: int | None = None
+    minute = 0
+    if "凌晨" in text:
+        hour = 2
+    elif "早上" in text:
+        hour = 8
+    elif "上午" in text:
+        hour = 9
+    elif "中午" in text:
+        hour = 12
+    elif "下午" in text:
+        hour = 15
+    elif "晚上" in text:
+        hour = 20
+
+    if hour is None:
+        if inferred_day.date() != mentioned_at.date():
+            hour = 12
+        else:
+            return None
+
+    return inferred_day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
 def _clamp_int(value: Any, low: int, high: int, default: int) -> int:
     """Clamp a value to [low, high] and fall back on invalid input."""
     if isinstance(value, bool):
@@ -798,6 +843,59 @@ class LifeStateService:
             self._ensure_prehistory_bootstrap_locked(now=now)
             self.memory_engine.decay_to(now)
             return self.memory_engine.build_prompt_evidence(ask, now=now, limit=limit)
+
+    async def record_recalled_event(
+        self,
+        *,
+        summary: str,
+        source_turn: str | None = None,
+        event_time_start: datetime | str | None = None,
+        event_time_end: datetime | str | None = None,
+        importance: float = 1.0,
+        certainty: float = 0.55,
+    ) -> dict[str, Any] | None:
+        """Record user-mentioned historical memory without treating it as current activity."""
+        text = _coerce_text(summary, "")
+        if not text:
+            return None
+
+        now = _now_local()
+        start_dt = _coerce_datetime(event_time_start)
+        if start_dt is None:
+            start_dt = _infer_recalled_event_time(text, mentioned_at=now) or now
+        end_dt = _coerce_datetime(event_time_end) or start_dt
+        if end_dt < start_dt:
+            end_dt = start_dt
+
+        conf = max(0.0, min(1.0, float(certainty)))
+        payload = {
+            "type": "recalled_event",
+            "summary": text,
+            "source": "dialog",
+            "source_kind": "dialog_recall",
+            "source_turn": str(source_turn or ""),
+            "time": _to_iso(start_dt),  # Backward compatibility for old readers.
+            "event_time_start": _to_iso(start_dt),
+            "event_time_end": _to_iso(end_dt),
+            "mentioned_time": _to_iso(now),
+            "stored_time": _to_iso(now),
+            "importance": max(0.0, float(importance)),
+            "source_confidence": conf,
+            "certainty": conf,
+            "self_relevance": 0.8,
+            "relationship_relevance": 0.2,
+            "emotional_weight": 0.25,
+            "novelty": 0.4,
+        }
+
+        async with self._lock:
+            self._ensure_prehistory_bootstrap_locked(now=now)
+            entry = self.memory_engine.ingest_event(payload)
+            self.memory_engine.decay_to(now)
+            out = dict(payload)
+            if entry and entry.id:
+                out["memory_id"] = entry.id
+            return out
 
     async def reinforce_memory_evidence(self, memory_ids: list[str]) -> int:
         """Reinforce memories that entered the final evidence set."""
