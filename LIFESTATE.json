@@ -1,0 +1,20 @@
+{
+  "location": "campus",
+  "activity": "study",
+  "mood": "低落",
+  "mood_score": -5,
+  "energy": 4,
+  "social_battery": 0,
+  "urgency_bias": 72,
+  "busy_level": 76,
+  "reply_delay_s": 18,
+  "verbosity": 0.42,
+  "last_tick": "2026-03-17T16:20:00+08:00",
+  "next_transition_at": "2026-03-17T17:55:00+08:00",
+  "last_update": "2026-03-17T16:20:00+08:00",
+  "override_until": null,
+  "override_reason": null,
+  "override_activity": null,
+  "override_location": null,
+  "override_busy_level": null
+}

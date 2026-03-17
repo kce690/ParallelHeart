@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -94,6 +95,8 @@ class AgentLoop:
         r"你想让我[^。！？!?]{0,20}还是[^。！？!?]{0,20}",
         r"你想我[^。！？!?]{0,20}还是[^。！？!?]{0,20}",
     )
+    _BODY_PROFILE_FILE = "BODY_PROFILE.json"
+    _BODY_PROFILE_SOURCE = "generated_persona_profile"
     _STATE_COMMITMENT_TTL = timedelta(minutes=12)
     _CURRENT_SNAPSHOT_MAX_AGE = timedelta(hours=3)
 
@@ -351,10 +354,18 @@ class AgentLoop:
         has_time_back_ref = bool(re.search(r"(刚才|刚刚|之前|方才|前面|上一会|刚那会)", flat))
         asks_activity = bool(re.search(r"(在干|在做|忙什么|做什么|在忙|在哪|在干嘛|在干啥)", flat))
         related_state_followup = cls._is_related_state_followup(flat)
+        asks_body_profile = bool(
+            re.search(
+                r"(多高|身高|多重|体重|几岁|年龄|长什么样|长啥样|什么样子|胖吗|瘦吗|胖不胖|瘦不瘦)",
+                flat,
+            )
+        )
         asks_meal = bool(re.search(r"(吃饭|午饭|晚饭|早饭|早餐|吃了没|吃了吗|吃的什么|饭吃了没)", flat))
         asks_mood = bool(re.search(r"(心情|开心|难受|烦|情绪|状态怎么样|是不是不开心)", flat))
         asks_availability = bool(re.search(r"(方便吗|有空吗|能聊吗|是不是刚忙完|忙完了没|现在忙吗)", flat))
 
+        if asks_body_profile:
+            return "body_profile"
         if asks_meal:
             return "meal"
         if asks_mood:
@@ -909,6 +920,192 @@ class AgentLoop:
             return ""
         return compact[:max_chars] if len(compact) > max_chars else compact
 
+    @staticmethod
+    def _load_json_object(path: Path) -> dict[str, Any] | None:
+        if not path.exists():
+            return None
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+            if not raw:
+                return None
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _parse_age_range(value: str) -> tuple[int, int]:
+        text = str(value or "").strip()
+        match = re.search(r"(\d{1,2})\D+(\d{1,2})", text)
+        if not match:
+            return 20, 29
+        low = int(match.group(1))
+        high = int(match.group(2))
+        if low > high:
+            low, high = high, low
+        low = max(16, min(50, low))
+        high = max(low, min(60, high))
+        return low, high
+
+    @classmethod
+    def _normalize_body_profile(cls, payload: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+
+        def _positive_int(key: str) -> int | None:
+            value = payload.get(key)
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, (int, float)):
+                parsed = int(round(float(value)))
+            elif isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return None
+                try:
+                    parsed = int(round(float(text)))
+                except Exception:
+                    return None
+            else:
+                return None
+            return parsed if parsed > 0 else None
+
+        height_cm = _positive_int("height_cm")
+        weight_kg = _positive_int("weight_kg")
+        age = _positive_int("age")
+        appearance = str(payload.get("appearance") or "").strip()
+        source = str(payload.get("source") or "").strip()
+        generated_at = str(payload.get("generated_at") or "").strip()
+
+        if not height_cm or not weight_kg or not age or not appearance or not source or not generated_at:
+            return None
+
+        return {
+            "height_cm": height_cm,
+            "weight_kg": weight_kg,
+            "age": age,
+            "appearance": appearance,
+            "source": source,
+            "generated_at": generated_at,
+        }
+
+    def _body_profile_path(self) -> Path:
+        return self.workspace / self._BODY_PROFILE_FILE
+
+    def _read_body_profile(self) -> dict[str, Any] | None:
+        payload = self._load_json_object(self._body_profile_path())
+        return self._normalize_body_profile(payload)
+
+    def _write_body_profile(self, profile: dict[str, Any]) -> None:
+        path = self._body_profile_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = json.dumps(profile, ensure_ascii=False, indent=2) + "\n"
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(data, encoding="utf-8")
+        os.replace(tmp, path)
+
+    def _generate_body_profile(self) -> dict[str, Any]:
+        role = "student"
+        age_range = "20-29"
+        traits: list[str] = []
+        interests: list[str] = []
+
+        prehistory_profile = self._load_json_object(self.workspace / "PREHISTORY_PROFILE.json") or {}
+        prehistory_meta = self._load_json_object(self.workspace / "memory" / "PREHISTORY_META.json") or {}
+        meta_profile = prehistory_meta.get("profile")
+        if not isinstance(meta_profile, dict):
+            meta_profile = {}
+
+        source_profile = prehistory_profile or meta_profile
+        role = str(source_profile.get("role") or role).strip().lower() or role
+        age_range = str(source_profile.get("age_range") or age_range).strip() or age_range
+        traits = [str(x).strip().lower() for x in source_profile.get("personality_traits", []) if str(x).strip()]
+        interests = [str(x).strip().lower() for x in source_profile.get("interests", []) if str(x).strip()]
+
+        low_age, high_age = self._parse_age_range(age_range)
+        if "student" in role:
+            low_age = max(low_age, 18)
+            high_age = min(high_age, 26)
+            if low_age > high_age:
+                low_age, high_age = 18, 24
+
+        seed_basis = "|".join(
+            [
+                str(self.workspace.resolve()),
+                role,
+                age_range,
+                ",".join(sorted(traits)[:4]),
+                ",".join(sorted(interests)[:4]),
+            ]
+        )
+        digest = hashlib.sha256(seed_basis.encode("utf-8")).hexdigest()
+        seed = int(digest[:12], 16)
+
+        age = low_age + (seed % (high_age - low_age + 1))
+        height_cm = 160 + ((seed >> 3) % 14)  # 160-173
+        bmi = 18.8 + (((seed >> 9) % 25) / 10.0)  # 18.8-21.2
+        weight_kg = int(round((height_cm / 100.0) ** 2 * bmi))
+        weight_kg = max(42, min(80, weight_kg))
+
+        if bmi < 19.5:
+            body_shape = "偏清瘦"
+        elif bmi < 22.0:
+            body_shape = "匀称偏瘦"
+        else:
+            body_shape = "匀称"
+
+        appearance_parts: list[str] = [body_shape]
+        if "student" in role:
+            appearance_parts.append("学生气")
+        if "warm" in traits:
+            appearance_parts.append("气质温和")
+        appearance_parts.append("穿着简洁")
+        appearance = "，".join(dict.fromkeys(appearance_parts))
+
+        profile = {
+            "height_cm": int(height_cm),
+            "weight_kg": int(weight_kg),
+            "age": int(age),
+            "appearance": appearance,
+            "source": self._BODY_PROFILE_SOURCE,
+            "generated_at": datetime.now().astimezone().replace(microsecond=0).isoformat(),
+        }
+        self._write_body_profile(profile)
+        logger.info("Generated BODY_PROFILE at {}", self._body_profile_path())
+        return profile
+
+    def _get_or_create_body_profile(self) -> dict[str, Any]:
+        profile = self._read_body_profile()
+        if profile:
+            return profile
+        return self._generate_body_profile()
+
+    def _body_profile_reply(self, user_text: str, profile: dict[str, Any]) -> str:
+        _, flat = self._normalize_user_text(user_text or "")
+        height = int(profile["height_cm"])
+        weight = int(profile["weight_kg"])
+        age = int(profile["age"])
+        appearance = str(profile["appearance"])
+
+        if re.search(r"(多高|身高)", flat):
+            return f"{height}cm左右"
+        if re.search(r"(多重|体重)", flat):
+            return f"{weight}kg左右"
+        if re.search(r"(几岁|年龄)", flat):
+            return f"{age}岁左右"
+        if re.search(r"(长什么样|长啥样|什么样子)", flat):
+            return appearance
+        if re.search(r"(胖吗|瘦吗|胖不胖|瘦不瘦)", flat):
+            bmi = weight / ((height / 100.0) ** 2)
+            if bmi < 19.5:
+                return "偏瘦一点，不胖"
+            if bmi < 22.5:
+                return "算匀称，不胖不瘦"
+            return "偏结实一点"
+        return f"我{height}cm，{weight}kg，{age}岁，{appearance}"
+
     def _build_slot_floor_reply(
         self,
         answer_slot: str,
@@ -928,6 +1125,10 @@ class AgentLoop:
 
         if answer_slot == "meta_self":
             return self._build_meta_self_floor_reply(user_text)
+
+        if answer_slot == "body_profile":
+            profile = self._get_or_create_body_profile()
+            return self._body_profile_reply(user_text, profile)
 
         if answer_slot == "current_activity":
             state = current_activity_state or self._resolve_current_activity_state(
@@ -1633,6 +1834,8 @@ class AgentLoop:
             return bool(re.search(r"(心情|开心|烦|还行|平静|一般|低落|不错)", text))
         if answer_slot == "availability":
             return bool(re.search(r"(忙|有空|方便|能聊|刚停|这会儿)", text))
+        if answer_slot == "body_profile":
+            return bool(re.search(r"(cm|kg|岁|瘦|胖|匀称|学生气|外形|样)", text))
         if answer_slot == "meta_self":
             return True
         return True
@@ -1665,6 +1868,7 @@ class AgentLoop:
         """Whether this slot should bypass LLM and answer from rule/evidence first."""
         return answer_slot in {
             "greeting",
+            "body_profile",
             "current_activity",
             "previous_activity",
             "meal",
@@ -1975,6 +2179,56 @@ class AgentLoop:
             if low_info_strategy
             else ("task_debug" if answer_slot == "meta_self" and allow_meta_technical else category)
         )
+        # Fast path: body-profile/meta/greeting slots should not invoke life-memory retrieval.
+        if answer_slot in {"greeting", "meta_self", "body_profile"} and not (
+            answer_slot == "meta_self" and allow_meta_technical
+        ):
+            slot_floor_reply = self._build_slot_floor_reply(
+                answer_slot,
+                msg.content,
+                {},
+                [],
+                memory_evidence=None,
+                memory_recall_level="none",
+                session_key=key,
+                related_state_followup=related_state_followup,
+                current_activity_state=None,
+            )
+            final_content = self._enforce_slot_answer(
+                answer_slot,
+                slot_floor_reply,
+                slot_floor_reply=slot_floor_reply,
+                allow_meta_technical=allow_meta_technical,
+            )
+            final_content = self._apply_anti_repeat_guard(
+                session_key=key,
+                answer_slot=answer_slot,
+                reply=final_content,
+                slot_floor_reply=slot_floor_reply,
+            ) or final_content
+            final_content = self._strip_short_reply_terminal_punct(msg.content, final_content) or final_content
+            if not final_content:
+                return None
+            from datetime import datetime
+
+            session.messages.append({"role": "user", "content": msg.content, "timestamp": datetime.now().isoformat()})
+            session.messages.append({"role": "assistant", "content": final_content, "timestamp": datetime.now().isoformat()})
+            session.updated_at = datetime.now()
+            self._record_reply_signature(key, answer_slot, final_content)
+            self._record_state_commitment(
+                session_key=key,
+                answer_slot=answer_slot,
+                resolved_state=None,
+                final_reply=final_content,
+            )
+            self.sessions.save(session)
+            await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+            preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
+            logger.info("Rule-first early response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content=final_content,
+                metadata=msg.metadata or {},
+            )
         state_snapshot = self.context.get_life_state_snapshot()
         recent_events = self.context.get_recent_life_events(limit=5)
         has_recent_event = bool(recent_events)

@@ -1,0 +1,70 @@
+{
+  "generator_version": "prehistory-v1",
+  "seed": 181130650627200,
+  "generated_at": "2026-03-17T20:55:50+08:00",
+  "horizon_days": 120,
+  "profile": {
+    "age_range": "20-29",
+    "life_stage": "young_adult",
+    "role": "student",
+    "city": null,
+    "locale": null,
+    "timezone": null,
+    "personality_traits": [
+      "curious",
+      "steady",
+      "warm"
+    ],
+    "interests": [
+      "reading",
+      "music",
+      "technology"
+    ],
+    "routine_phases": [
+      "morning",
+      "work_block",
+      "lunch",
+      "afternoon",
+      "evening"
+    ],
+    "identity_facts": [
+      "Values reliability in close relationships."
+    ],
+    "seed_facts": [],
+    "relationship_with_user": false,
+    "relationship_stage": "unknown",
+    "relationship_tone": "neutral",
+    "relationship_trust": 0.0,
+    "relationship_conflict_last7d": 0.0,
+    "profile_hash": "ac5cf4ea750b94c2a8d53256333807b25a69a17c"
+  },
+  "summary": {
+    "event_count": 161,
+    "type_counts": {
+      "routine": 151,
+      "milestone": 3,
+      "identity_milestone": 1,
+      "salient_incident": 3,
+      "preference_forming": 3
+    },
+    "tier_counts": {
+      "pinned": 1,
+      "durable": 6,
+      "normal": 30,
+      "volatile": 124
+    },
+    "time_scales": {
+      "recent_days": 26,
+      "medium_weeks": 62,
+      "deep_months": 73
+    },
+    "routine_traces": 151,
+    "relationship_events": 0,
+    "oldest_event_at": "2025-11-18T12:20:00+08:00",
+    "latest_event_at": "2026-03-17T16:20:00+08:00"
+  },
+  "relationship_mode": "no_shared_history",
+  "raw_event_count": 161,
+  "rebuilt_memory_entries": 161,
+  "version": 1
+}
