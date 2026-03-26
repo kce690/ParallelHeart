@@ -9,6 +9,10 @@ from nanobot.companion.life_state.memory_config import MemoryForgettingConfig
 from nanobot.companion.life_state.memory_models import MemoryEntry
 from nanobot.companion.life_state.memory_utils import parse_iso, to_iso
 
+_PROFILE_DECAY_MULTIPLIERS: dict[str, tuple[float, float]] = {
+    "generated_detail": (2.4, 1.9),
+}
+
 
 def decay_entry(
     entry: MemoryEntry,
@@ -36,6 +40,9 @@ def decay_entry(
 
     lambda_detail = float(entry.decay_overrides.get("lambda_detail", cfg.decay.lambda_detail))
     lambda_gist = float(entry.decay_overrides.get("lambda_gist", cfg.decay.lambda_gist))
+    mul_detail, mul_gist = _profile_decay_multiplier(entry)
+    lambda_detail *= mul_detail
+    lambda_gist *= mul_gist
     detail_factor = math.exp(-max(0.0, lambda_detail) * max(0.0, tier_mul) * detail_hours)
     gist_factor = math.exp(-max(0.0, lambda_gist) * max(0.0, tier_mul) * gist_hours)
 
@@ -90,3 +97,10 @@ def _strength_floors(entry: MemoryEntry, cfg: MemoryForgettingConfig) -> tuple[f
     gist = float(tier_floor.get("gist", 0.0))
     return max(0.0, detail), max(0.0, gist)
 
+
+def _profile_decay_multiplier(entry: MemoryEntry) -> tuple[float, float]:
+    source_kind = str(entry.source_kind or "").strip().lower()
+    if source_kind == "generated_detail":
+        return _PROFILE_DECAY_MULTIPLIERS["generated_detail"]
+    profile = str(entry.decay_profile or "").strip().lower()
+    return _PROFILE_DECAY_MULTIPLIERS.get(profile, (1.0, 1.0))

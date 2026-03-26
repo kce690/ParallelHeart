@@ -23,6 +23,9 @@ class PrehistoryProfile:
     age_range: str = "20-29"
     life_stage: str = "young_adult"
     role: str = "student"
+    gender: str = "female"
+    gender_label: str = "女生"
+    identity_style: str = "女性人设"
     city: str | None = None
     locale: str | None = None
     timezone: str | None = None
@@ -47,16 +50,24 @@ class PrehistoryProfile:
     ) -> "PrehistoryProfile":
         """Load persona profile from optional structured workspace files."""
         custom = _load_json_object(workspace / "PREHISTORY_PROFILE.json")
+        identity_profile = _load_json_object(workspace / "IDENTITY_PROFILE.json")
         relationship = _load_json_object(workspace / "RELATIONSHIP.json")
         life_state = _load_json_object(workspace / "LIFESTATE.json")
 
         data = dict(custom)
+        if isinstance(identity_profile, dict):
+            for key in ("gender", "gender_label", "identity_style"):
+                if identity_profile.get(key) not in (None, "") and key not in data:
+                    data[key] = identity_profile.get(key)
         data.update(overrides or {})
         profile = cls()
 
         profile.age_range = _text(data.get("age_range"), profile.age_range)
         profile.life_stage = _text(data.get("life_stage"), profile.life_stage)
         profile.role = _text(data.get("role"), profile.role).lower()
+        profile.gender = _text(data.get("gender"), profile.gender).lower()
+        profile.gender_label = _text(data.get("gender_label"), profile.gender_label)
+        profile.identity_style = _text(data.get("identity_style"), profile.identity_style)
         profile.city = _text_or_none(data.get("city"))
         profile.locale = _text_or_none(data.get("locale"))
         profile.timezone = _text_or_none(data.get("timezone"))
@@ -119,6 +130,9 @@ class PrehistoryProfile:
             "age_range": self.age_range,
             "life_stage": self.life_stage,
             "role": self.role,
+            "gender": self.gender,
+            "gender_label": self.gender_label,
+            "identity_style": self.identity_style,
             "city": self.city,
             "locale": self.locale,
             "timezone": self.timezone,
@@ -143,6 +157,9 @@ class PrehistoryProfile:
             "age_range": self.age_range,
             "life_stage": self.life_stage,
             "role": self.role,
+            "gender": self.gender,
+            "gender_label": self.gender_label,
+            "identity_style": self.identity_style,
             "city": self.city,
             "locale": self.locale,
             "timezone": self.timezone,
@@ -297,4 +314,3 @@ def _float01(value: Any, default: float) -> float:
         except Exception:
             return default
     return default
-

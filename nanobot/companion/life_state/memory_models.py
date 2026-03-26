@@ -111,6 +111,9 @@ class MemoryEvidence:
     permanence_tier: str
     pinned_flag: bool
     coarse_type: str = "default"
+    source_kind: str = ""
+    memory_type: str = "life_event"
+    source_confidence: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -118,6 +121,6 @@ class MemoryEvidence:
 
 def _coerce_coarse_type(value: Any) -> str:
     text = str(value or "").strip().lower()
-    if text in {"meal", "study", "relationship"}:
+    if text in {"meal", "study", "relationship", "activity", "availability", "previous_activity"}:
         return text
     return "default"

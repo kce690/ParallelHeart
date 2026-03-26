@@ -1,0 +1,21 @@
+{
+  "age_range": "20-25",
+  "life_stage": "young_adult",
+  "role": "student",
+  "gender": "female",
+  "gender_label": "女生",
+  "identity_style": "温和但有主见的大学生",
+  "personality_traits": [
+    "好奇",
+    "稳重",
+    "温暖"
+  ],
+  "interests": [
+    "阅读",
+    "音乐",
+    "科技"
+  ],
+  "identity_facts": [
+    "在亲密关系中重视可靠性"
+  ]
+}

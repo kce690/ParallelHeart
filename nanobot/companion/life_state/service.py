@@ -1,4 +1,4 @@
-"""Rule-based life-state service with sparse wake-up and offline catch-up.
+﻿"""Rule-based life-state service with sparse wake-up and offline catch-up.
 
 Includes deterministic prehistory bootstrap that seeds immutable raw life events
 so long-term memory starts from an event stream (not static backstory text).
@@ -16,8 +16,10 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
+from nanobot.companion.life_state.fact_store import LifeFactStore
 from nanobot.companion.life_state.memory_engine import LifeMemoryEngine
 from nanobot.companion.life_state.prehistory_generator import PrehistoryBootstrapGenerator
+from nanobot.utils.mojibake import analyze_mojibake
 
 
 def _now_local() -> datetime:
@@ -97,7 +99,7 @@ def _infer_recalled_decay_profile(summary: str) -> tuple[str, str]:
         return "anchor", "default"
     if re.search(r"(relationship|friend|family|partner|关系|朋友|家人|恋人)", text):
         return "relationship", "relationship"
-    if re.search(r"(meal|lunch|dinner|breakfast|吃|饭|早餐|午饭|晚饭)", text):
+    if re.search(r"(meal|lunch|dinner|breakfast|吃饭|早餐|午饭|晚饭)", text):
         return "meal", "meal"
     if re.search(r"(study|class|course|exam|学习|上课|复习|考试)", text):
         return "study", "study"
@@ -116,6 +118,27 @@ def _coarse_recall_summaries(*, decay_profile: str, coarse_type: str) -> tuple[s
         text = "A long-term core milestone was involved."
         return text, text
     return "A past event happened in that period.", "A past event happened in that period."
+
+
+def _generated_detail_coarse_type(slot: str) -> str:
+    value = str(slot or "").strip().lower()
+    if value == "meal":
+        return "meal"
+    if value == "availability":
+        return "availability"
+    if value == "previous_activity":
+        return "previous_activity"
+    return "activity"
+
+
+def _generated_detail_gist_trace(*, slot: str, coarse_type: str) -> tuple[str, str]:
+    if coarse_type == "meal":
+        return "Had some meal-related detail in that period.", "Seemed to have had something to eat around that time."
+    if coarse_type == "availability":
+        return "Had a busy/availability state in that period.", "Seemed to be in some busy/free state around that time."
+    if coarse_type == "previous_activity":
+        return "Had some earlier activity detail in that period.", "Seemed to have been doing something shortly before."
+    return "Was occupied with some activity in that period.", "Seemed to have been doing something around that time."
 
 
 def _clamp_int(value: Any, low: int, high: int, default: int) -> int:
@@ -158,6 +181,38 @@ def _coerce_text(value: Any, default: str) -> str:
     return default
 
 
+_STATE_TEXT_REPAIRS = {
+    "瀹?": "家里",
+    "浼戞伅": "休息",
+    "骞抽潤": "平静",
+    "鐫¤": "睡觉",
+    "璧峰簥": "起床",
+    "鍚冮キ": "吃饭",
+    "瀛︿範": "学习",
+    "閫氬嫟": "通勤",
+    "濞变箰": "娱乐",
+    "鐫″墠": "睡前",
+    "瀛︽牎": "学校",
+    "澶栭潰": "外面",
+    "璺笂": "路上",
+}
+
+
+def _repair_known_state_text(value: Any, *, field: str, default: str) -> str:
+    text = _coerce_text(value, default)
+    repaired = _STATE_TEXT_REPAIRS.get(text, text)
+    detected, reason = analyze_mojibake(text)
+    if detected and repaired != text:
+        logger.warning(
+            "LifeState: repaired mojibake field={} value={} repaired={} reason={} likely_origin=state_file_or_runtime_literal",
+            field,
+            text,
+            repaired,
+            reason,
+        )
+    return repaired
+
+
 def _mood_to_score(value: Any) -> int:
     """Convert existing mood field to a numeric score."""
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -165,13 +220,14 @@ def _mood_to_score(value: Any) -> int:
     text = _coerce_text(value, "")
     if not text:
         return 1
-    if any(k in text for k in ("低落", "烦", "丧", "差")):
+    lowered = text.lower()
+    if any(k in lowered for k in ("low", "down", "bad", "sad", "tired", "烦", "累", "差")):
         return -2
-    if any(k in text for k in ("一般", "还行", "普通")):
+    if any(k in lowered for k in ("ok", "normal", "fine", "一般", "还行", "平稳")):
         return 0
-    if any(k in text for k in ("开心", "不错", "好")):
+    if any(k in lowered for k in ("good", "great", "nice", "开心", "不错", "好")):
         return 3
-    if any(k in text for k in ("平静", "平稳", "淡定")):
+    if any(k in lowered for k in ("calm", "steady", "平静", "平稳", "淡定")):
         return 1
     return 1
 
@@ -181,7 +237,7 @@ def _score_to_mood(score: int) -> str:
     if score <= -3:
         return "低落"
     if score <= -1:
-        return "有点烦"
+        return "有点累"
     if score == 0:
         return "一般"
     if score <= 2:
@@ -206,6 +262,8 @@ class LifeStateService:
     _MAX_CATCHUP_STEPS = 768
     _PREHISTORY_META_VERSION = 1
     _PREHISTORY_CONFIRM_TOKEN = "REGENERATE_PREHISTORY"
+    _FACT_MEMORY_MIN_AGE = timedelta(minutes=5)
+    _FACT_MEMORY_MAX_BATCH = 4
 
     def __init__(self, workspace: Path, enabled: bool = True):
         self.workspace = workspace
@@ -213,6 +271,7 @@ class LifeStateService:
         self.state_path = workspace / "LIFESTATE.json"
         self.life_log_path = workspace / "LIFELOG.md"
         self.memory_engine = LifeMemoryEngine(workspace)
+        self.fact_store = LifeFactStore(workspace)
         self.prehistory_generator = PrehistoryBootstrapGenerator(workspace)
         self.prehistory_meta_path = self.memory_engine.store.memory_index_path.parent / "PREHISTORY_META.json"
         self._running = False
@@ -226,7 +285,7 @@ class LifeStateService:
     def _default_state(now: datetime) -> dict[str, Any]:
         """Default life-state payload."""
         return {
-            "location": "家",
+            "location": "家里",
             "activity": "休息",
             "mood": "平静",
             "mood_score": 1,
@@ -266,8 +325,8 @@ class LifeStateService:
         state = self._default_state(now)
         state.update(payload or {})
 
-        state["location"] = _coerce_text(state.get("location"), "家")
-        state["activity"] = _coerce_text(state.get("activity"), "休息")
+        state["location"] = _repair_known_state_text(state.get("location"), field="location", default="家里")
+        state["activity"] = _repair_known_state_text(state.get("activity"), field="activity", default="休息")
         mood_score = _mood_to_score(state.get("mood_score", state.get("mood")))
         state["mood_score"] = max(-5, min(5, mood_score))
         state["mood"] = _score_to_mood(state["mood_score"])
@@ -617,32 +676,32 @@ class LifeStateService:
         social = int(state.get("social_battery", 66))
 
         if slot == "deep_night":
-            return "家", "睡觉", 10
+            return "家里", "睡觉", 10
         if slot == "morning":
-            return "家", ("起床" if self._rng.random() < 0.55 else "吃饭"), 35
+            return "家里", ("起床" if self._rng.random() < 0.55 else "吃饭"), 35
         if slot == "study_am":
             return ("学校" if self._rng.random() < 0.75 else "外面"), "学习", 78
         if slot == "lunch":
-            return ("外面" if self._rng.random() < 0.6 else "家"), "吃饭", 40
+            return ("外面" if self._rng.random() < 0.6 else "家里"), "吃饭", 40
         if slot == "afternoon":
             if energy < 28:
-                return "家", "休息", 30
-            candidates = [("学校", "学习", 75), ("家", "休息", 35), ("外面", "娱乐", 45), ("路上", "通勤", 60)]
+                return "家里", "休息", 30
+            candidates = [("学校", "学习", 75), ("家里", "休息", 35), ("外面", "娱乐", 45), ("路上", "通勤", 60)]
             weights = [0.45, 0.25, 0.2, 0.1]
             if social < 25:
                 weights = [0.35, 0.45, 0.1, 0.1]
             return self._rng.choices(candidates, weights=weights, k=1)[0]
         if slot == "dinner":
             if energy < 24:
-                return "家", "休息", 20
-            return ("家" if self._rng.random() < 0.7 else "外面"), ("吃饭" if self._rng.random() < 0.65 else "休息"), 32
+                return "家里", "休息", 20
+            return ("家里" if self._rng.random() < 0.7 else "外面"), ("吃饭" if self._rng.random() < 0.65 else "休息"), 32
         if slot == "evening":
-            candidates = [("家", "娱乐", 28), ("家", "休息", 24), ("家", "学习", 55)]
+            candidates = [("家里", "娱乐", 28), ("家里", "休息", 24), ("家里", "学习", 55)]
             weights = [0.45, 0.35, 0.2]
             if int(state.get("urgency_bias", 35)) > 70:
                 weights = [0.25, 0.25, 0.5]
             return self._rng.choices(candidates, weights=weights, k=1)[0]
-        return "家", "睡前", 18
+        return "家里", "睡前", 18
 
     def _activity_delta(self, activity: str) -> tuple[int, int]:
         """Return (energy_delta, social_delta)."""
@@ -705,7 +764,7 @@ class LifeStateService:
                 "起床": "刚起床",
                 "吃饭": "刚吃饭了",
                 "学习": "这会儿在忙学习",
-                "休息": "这会儿在家歇着" if location == "家" else "这会儿在歇会儿",
+                "休息": "这会儿在家歇着" if location == "家里" else "这会儿在外面待会儿",
                 "通勤": "在路上",
                 "娱乐": "在放松",
                 "睡前": "准备睡了",
@@ -717,8 +776,8 @@ class LifeStateService:
                 summary = "刚出门在路上"
             elif location == "外面":
                 summary = "这会儿在外面"
-            elif location == "家":
-                summary = "回到家了"
+            elif location == "家里":
+                summary = "回到家里了"
             importance = 2
         else:
             prev_energy = _clamp_int(previous.get("energy"), 0, 100, 60)
@@ -764,6 +823,120 @@ class LifeStateService:
             self.memory_engine.ingest_event(payload)
         except Exception as exc:
             logger.warning("LifeState: failed to ingest memory event: {}", exc)
+        try:
+            fact = self._event_to_fact_payload(event, when=when)
+            if fact:
+                self.fact_store.append_fact(fact)
+                self._consolidate_facts_to_memory_locked(now=when, max_items=2)
+        except Exception as exc:
+            logger.warning("LifeState: failed to write event fact: {}", exc)
+
+    def _event_to_fact_payload(self, event: dict[str, Any], *, when: datetime) -> dict[str, Any] | None:
+        summary = _coerce_text(event.get("summary"), "")
+        if not summary:
+            return None
+        event_type = _coerce_text(event.get("type"), "")
+        source = "state_transition" if event_type == "state_transition" else "system_event"
+        fact_type = "activity" if event_type in {"state_transition", "override"} else "event"
+        ttl_seconds = 45 * 60 if fact_type == "activity" else 3 * 60 * 60
+        return {
+            "fact_type": fact_type,
+            "content": summary,
+            "source": source,
+            "confidence": "strong",
+            "publicly_answerable": True,
+            "start_at": _to_iso(when),
+            "end_at": event.get("end_at"),
+            "ttl_seconds": ttl_seconds,
+            "metadata": {
+                "event_type": event_type or "unknown",
+                "event_source": _coerce_text(event.get("source"), ""),
+                "importance": _clamp_float(event.get("importance"), 0.0, 5.0, 1.0),
+            },
+        }
+
+    @staticmethod
+    def _fact_confidence_numeric(confidence: str) -> float:
+        value = str(confidence or "").strip().lower()
+        if value == "strong":
+            return 0.92
+        if value == "medium":
+            return 0.72
+        return 0.5
+
+    def _is_high_value_fact_for_memory(self, fact: dict[str, Any], *, now: datetime) -> bool:
+        metadata = fact.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if metadata.get("memory_id"):
+            return False
+        if bool(metadata.get("skip_memory")):
+            return False
+        fact_type = str(fact.get("fact_type") or "").strip().lower()
+        if fact_type not in {"activity", "event"}:
+            return False
+        confidence = str(fact.get("confidence") or "").strip().lower()
+        if confidence != "strong":
+            return False
+        source = str(fact.get("source") or "").strip().lower()
+        if source in {"inference"}:
+            return False
+        content = str(fact.get("content") or "").strip()
+        if len(content) < 2:
+            return False
+        start = _parse_iso(fact.get("start_at")) or now
+        age = now - start
+        return age >= self._FACT_MEMORY_MIN_AGE
+
+    def _consolidate_facts_to_memory_locked(self, *, now: datetime, max_items: int | None = None) -> int:
+        target = now.replace(microsecond=0)
+        cap = max(1, min(12, int(max_items or self._FACT_MEMORY_MAX_BATCH)))
+        facts = self.fact_store.load_all()
+        if not facts:
+            return 0
+
+        ordered = sorted(
+            facts,
+            key=lambda x: (_parse_iso(x.get("start_at")) or target, str(x.get("fact_id") or "")),
+        )
+
+        updated = False
+        count = 0
+        for fact in ordered:
+            if count >= cap:
+                break
+            if not self._is_high_value_fact_for_memory(fact, now=target):
+                continue
+            metadata = fact.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            payload = {
+                "type": f"fact_{str(fact.get('fact_type') or 'event')}",
+                "summary": str(fact.get("content") or "").strip(),
+                "source": "fact_layer",
+                "source_kind": "fact_layer_consolidation",
+                "time": str(fact.get("start_at") or _to_iso(target)),
+                "event_time_start": str(fact.get("start_at") or _to_iso(target)),
+                "event_time_end": str(fact.get("end_at") or fact.get("start_at") or _to_iso(target)),
+                "stored_time": _to_iso(target),
+                "source_confidence": self._fact_confidence_numeric(str(fact.get("confidence") or "")),
+                "importance": 1.25 if str(fact.get("fact_type")) == "activity" else 1.05,
+                "coarse_type": str(metadata.get("coarse_type") or "default"),
+            }
+            entry = self.memory_engine.ingest_event(payload)
+            if not entry:
+                continue
+            metadata["memory_id"] = entry.id
+            metadata["memory_pipeline"] = "fact_layer"
+            metadata["consolidated_at"] = _to_iso(target)
+            fact["metadata"] = metadata
+            updated = True
+            count += 1
+
+        if updated:
+            self.fact_store.replace_all(facts)
+            self.memory_engine.decay_to(target)
+        return count
 
     def _advance_once(
         self,
@@ -875,6 +1048,220 @@ class LifeStateService:
             self.memory_engine.decay_to(now)
             return self.memory_engine.build_prompt_evidence(ask, now=now, limit=limit)
 
+    async def append_fact(
+        self,
+        *,
+        fact_type: str,
+        content: str,
+        source: str,
+        confidence: str,
+        publicly_answerable: bool,
+        start_at: datetime | str | None = None,
+        end_at: datetime | str | None = None,
+        expires_at: datetime | str | None = None,
+        ttl_seconds: int | None = None,
+        metadata: dict[str, Any] | None = None,
+        consolidate_to_memory: bool = True,
+    ) -> dict[str, Any] | None:
+        """Append one short-lived activity fact."""
+        text = _coerce_text(content, "")
+        if not text:
+            return None
+        start_dt = _coerce_datetime(start_at) or _now_local()
+        end_dt = _coerce_datetime(end_at)
+        if end_dt and end_dt < start_dt:
+            end_dt = start_dt
+        expires_dt = _coerce_datetime(expires_at)
+
+        payload = {
+            "fact_type": str(fact_type or "").strip().lower(),
+            "content": text,
+            "source": str(source or "").strip().lower(),
+            "confidence": str(confidence or "").strip().lower(),
+            "publicly_answerable": bool(publicly_answerable),
+            "start_at": _to_iso(start_dt),
+            "end_at": _to_iso(end_dt) if end_dt else None,
+            "expires_at": _to_iso(expires_dt) if expires_dt else None,
+            "ttl_seconds": ttl_seconds,
+            "metadata": dict(metadata or {}),
+        }
+        async with self._lock:
+            self._ensure_prehistory_bootstrap_locked(now=_now_local())
+            row = self.fact_store.append_fact(payload)
+            if row and consolidate_to_memory:
+                self._consolidate_facts_to_memory_locked(now=_now_local())
+            if row and str(row.get("confidence") or "").strip().lower() == "strong":
+                is_meal_like = bool(
+                    re.search(r"(meal|lunch|dinner|breakfast|\u5403|\u996d)", str(row.get("content") or ""), flags=re.IGNORECASE)
+                )
+                coarse = "meal" if is_meal_like else "activity"
+                downgraded = self.memory_engine.downgrade_generated_details_by_fact(
+                    fact_content=str(row.get("content") or ""),
+                    fact_start_at=_parse_iso(row.get("start_at")) or _now_local(),
+                    coarse_type=coarse,
+                )
+                if downgraded:
+                    logger.info(
+                        "LifeState: hard fact suppressed generated_detail count={} fact_id={} confidence={}",
+                        downgraded,
+                        str(row.get("fact_id") or ""),
+                        str(row.get("confidence") or ""),
+                    )
+            return row
+
+    async def read_facts(
+        self,
+        *,
+        limit: int = 12,
+        fact_types: list[str] | None = None,
+        confidences: list[str] | None = None,
+        publicly_answerable: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read recent valid facts with optional filters."""
+        async with self._lock:
+            self.fact_store.prune()
+            return self.fact_store.read_facts(
+                limit=limit,
+                fact_types=fact_types,
+                confidences=confidences,
+                publicly_answerable=publicly_answerable,
+                include_expired=False,
+            )
+
+    async def prune_facts(self) -> int:
+        """Prune expired fact rows and apply capacity bound."""
+        async with self._lock:
+            return self.fact_store.prune()
+
+    async def consolidate_facts_to_memory(self, *, max_items: int = 4) -> int:
+        """Consolidate high-value recent facts into long-term life memory."""
+        async with self._lock:
+            self._ensure_prehistory_bootstrap_locked(now=_now_local())
+            return self._consolidate_facts_to_memory_locked(now=_now_local(), max_items=max_items)
+
+    async def record_dialogue_activity_fact(
+        self,
+        *,
+        content: str,
+        confidence: str = "weak",
+        publicly_answerable: bool = False,
+        source: str = "dialogue",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Persist dialogue-derived short-horizon activity observation."""
+        return await self.append_fact(
+            fact_type="observation",
+            content=content,
+            source=source,
+            confidence=confidence,
+            publicly_answerable=publicly_answerable,
+            ttl_seconds=15 * 60,
+            metadata=metadata or {},
+            consolidate_to_memory=False,
+        )
+
+    async def record_generated_detail(
+        self,
+        *,
+        slot: str,
+        content: str,
+        source_turn: str | None = None,
+        publicly_answerable: bool = True,
+        confidence: float = 0.42,
+    ) -> dict[str, Any] | None:
+        """Record model-generated life detail as weak, decaying long-term memory."""
+        text = _coerce_text(content, "")
+        if not text:
+            return None
+        detected, reason = analyze_mojibake(text)
+        if detected:
+            logger.warning(
+                "LifeState: generated_detail dropped because mojibake detected slot={} content={} reason={} likely_origin=reply_or_memory_chain",
+                str(slot or "current_activity").strip().lower(),
+                text[:80],
+                reason,
+            )
+            return None
+
+        now = _now_local()
+        slot_name = str(slot or "current_activity").strip().lower()
+        coarse_type = _generated_detail_coarse_type(slot_name)
+        gist_summary, trace_summary = _generated_detail_gist_trace(slot=slot_name, coarse_type=coarse_type)
+        certainty = max(0.15, min(0.58, float(confidence)))
+
+        start_at = now
+        if re.search(r"(just|recently|before|earlier|\u521a|\u521a\u521a|\u521a\u624d|\u4e4b\u524d)", text, flags=re.IGNORECASE):
+            start_at = now - timedelta(minutes=20)
+        end_at = now if coarse_type in {"availability", "previous_activity"} else now + timedelta(minutes=40)
+
+        payload = {
+            "type": f"generated_detail_{slot_name}",
+            "summary": text,
+            "source": "model_generated",
+            "source_kind": "generated_detail",
+            "fact_source": "model_generated",
+            "source_turn": str(source_turn or ""),
+            "time": _to_iso(start_at),
+            "event_time_start": _to_iso(start_at),
+            "event_time_end": _to_iso(end_at),
+            "mentioned_time": _to_iso(now),
+            "stored_time": _to_iso(now),
+            "importance": 0.38,
+            "self_relevance": 0.72,
+            "relationship_relevance": 0.12,
+            "emotional_weight": 0.18,
+            "novelty": 0.30,
+            "source_confidence": certainty,
+            "certainty": certainty,
+            "publicly_answerable": bool(publicly_answerable),
+            "coarse_type": coarse_type,
+            "decay_profile": "generated_detail",
+            "gist": gist_summary,
+            "trace_summary": trace_summary,
+            "pinned": False,
+            "core_memory": False,
+            "decay_overrides": {
+                "lambda_detail": self.memory_engine.config.decay.lambda_detail * 2.8,
+                "lambda_gist": self.memory_engine.config.decay.lambda_gist * 2.2,
+            },
+        }
+
+        async with self._lock:
+            self._ensure_prehistory_bootstrap_locked(now=now)
+            entry = self.memory_engine.ingest_event(payload)
+            self.memory_engine.decay_to(now)
+            if not entry:
+                return None
+            logger.info(
+                "LifeState: generated_detail stored slot={} memory_id={} confidence={} decay_profile={} coarse_type={} content={}",
+                slot_name,
+                entry.id,
+                certainty,
+                "generated_detail",
+                coarse_type,
+                text[:80],
+            )
+            return {
+                "memory_id": entry.id,
+                "slot": slot_name,
+                "fact_type": "generated_detail",
+                "source_kind": "generated_detail",
+                "fact_source": "model_generated",
+                "confidence": certainty,
+                "publicly_answerable": bool(publicly_answerable),
+                "created_at": _to_iso(now),
+                "event_time_start": _to_iso(start_at),
+                "event_time_end": _to_iso(end_at),
+                "decay_profile": "generated_detail",
+                "coarse_type": coarse_type,
+                "detail_strength": float(entry.detail_strength),
+                "gist_strength": float(entry.gist_strength),
+                "pinned_flag": False,
+                "memory_type": entry.memory_type,
+                "content": text,
+                "summary": gist_summary,
+            }
+
     async def record_recalled_event(
         self,
         *,
@@ -936,11 +1323,67 @@ class LifeStateService:
         async with self._lock:
             self._ensure_prehistory_bootstrap_locked(now=now)
             entry = self.memory_engine.ingest_event(payload)
+            self.fact_store.append_fact(
+                {
+                    "fact_type": "observation",
+                    "content": text,
+                    "source": "dialogue",
+                    "confidence": "weak",
+                    "publicly_answerable": False,
+                    "start_at": _to_iso(now),
+                    "ttl_seconds": 15 * 60,
+                    "metadata": {
+                        "kind": "recalled_event",
+                        "source_turn": str(source_turn or ""),
+                    },
+                }
+            )
             self.memory_engine.decay_to(now)
             out = dict(payload)
             if entry and entry.id:
                 out["memory_id"] = entry.id
             return out
+
+    async def record_generated_timeline_event(
+        self,
+        *,
+        summary: str,
+        source_turn: str | None = None,
+        answer_slot: str | None = None,
+        publicly_answerable: bool = True,
+        importance: float = 0.9,
+    ) -> dict[str, Any] | None:
+        """Persist one generated short-horizon timeline item for later state/status continuity."""
+        text = _coerce_text(summary, "")
+        if not text:
+            return None
+
+        now = _now_local()
+        slot_name = str(answer_slot or "current_activity").strip().lower() or "current_activity"
+        payload = {
+            "time": _to_iso(now),
+            "type": f"generated_timeline_{slot_name}",
+            "summary": text,
+            "source": "reply_backfill",
+            "importance": max(0.2, min(2.0, float(importance))),
+            "metadata": {
+                "kind": "generated_timeline",
+                "answer_slot": slot_name,
+                "source_turn": str(source_turn or ""),
+                "publicly_answerable": bool(publicly_answerable),
+            },
+        }
+
+        async with self._lock:
+            self._ensure_prehistory_bootstrap_locked(now=now)
+            self._append_event(payload)
+            return {
+                "summary": text,
+                "time": _to_iso(now),
+                "answer_slot": slot_name,
+                "source": "reply_backfill",
+                "publicly_answerable": bool(publicly_answerable),
+            }
 
     async def reinforce_memory_evidence(self, memory_ids: list[str]) -> int:
         """Reinforce memories that entered the final evidence set."""
@@ -1043,7 +1486,7 @@ class LifeStateService:
                     {
                         "time": _to_iso(now),
                         "type": "override",
-                        "summary": f"临时状态：{'，'.join(summary_parts)}",
+                        "summary": f"临时状态：{','.join(summary_parts)}",
                         "source": "override",
                         "importance": 2,
                     }

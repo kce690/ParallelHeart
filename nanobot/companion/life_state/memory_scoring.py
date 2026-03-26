@@ -250,9 +250,17 @@ def _score_novelty(cluster_pressure: float) -> float:
 
 
 def _score_source_confidence(event: dict[str, Any]) -> float:
+    explicit = event.get("source_confidence", event.get("certainty"))
+    if isinstance(explicit, (int, float)) and not isinstance(explicit, bool):
+        value = float(explicit)
+        if value > 1.0:
+            value = value / 100.0
+        return _clamp01(value)
     source = str(event.get("source") or "").strip().lower()
     if source in {"override", "manual"}:
         return 0.95
+    if source in {"model_generated"}:
+        return 0.45
     if source in {"timer", "offline"}:
         return 0.82
     return 0.76

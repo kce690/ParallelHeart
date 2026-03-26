@@ -1,10 +1,16 @@
 {
   "stage": "warming_up",
+  "stage_note": "关系阶段：升温期",
   "intimacy": 0.35,
+  "intimacy_note": "亲密度",
   "trust": 0.4,
+  "trust_note": "信任度",
   "conflict_last7d": 0,
+  "conflict_last7d_note": "过去7天冲突次数",
   "user_preference": {
     "emoji_density": "low",
-    "late_reply_ok": true
+    "emoji_density_note": "表情使用密度：低",
+    "late_reply_ok": true,
+    "late_reply_ok_note": "允许晚一点回复"
   }
 }

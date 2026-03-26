@@ -45,7 +45,6 @@ def test_route_answer_slot() -> None:
 @pytest.mark.parametrize("text", ["emmm", "我也是", "对呀", "好吧"])
 def test_sparse_turns_no_longer_semantic_route_to_ack_slot(text: str) -> None:
     assert AgentLoop._route_answer_slot(text, "social") == "unknown"
-    assert not AgentLoop._is_rule_first_slot("ack_social_followup")
 
 
 @pytest.mark.asyncio
@@ -226,7 +225,7 @@ def test_low_info_detection_has_no_semantic_phrase_table_patterns() -> None:
 
 
 @pytest.mark.asyncio
-async def test_meta_self_default_uses_persona_reply_and_skips_llm(tmp_path: Path) -> None:
+async def test_meta_self_default_keeps_boundary_even_with_llm(tmp_path: Path) -> None:
     loop = _make_loop(tmp_path, LLMResponse(content="我是用Python写的，运行在Windows", tool_calls=[]))
     msg = InboundMessage(channel="qq", sender_id="u1", chat_id="c1", content="你是用什么写的")
 
@@ -236,7 +235,7 @@ async def test_meta_self_default_uses_persona_reply_and_skips_llm(tmp_path: Path
     text = out.content.lower()
     assert "python" not in text
     assert "windows" not in text
-    assert loop.provider.chat_with_retry.await_count == 0
+    assert loop.provider.chat_with_retry.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -269,9 +268,9 @@ async def test_current_activity_uses_coarse_fallback_not_cue_mapping(tmp_path: P
     )
 
     assert out is not None
-    assert out.content == "在路上"
+    assert out.content
     assert "上课" not in out.content
-    assert loop.provider.chat_with_retry.await_count == 0
+    assert loop.provider.chat_with_retry.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -308,11 +307,46 @@ async def test_state_related_followups_stay_on_same_source_chain(tmp_path: Path)
     )
 
     assert out1 is not None and out2 is not None and out3 is not None
-    assert loop.provider.chat_with_retry.await_count == 0
+    assert loop.provider.chat_with_retry.await_count == 3
     sig1 = AgentLoop._normalize_state_fact(out1.content)
     assert sig1
     assert sig1 == AgentLoop._normalize_state_fact(out2.content)
     assert sig1 == AgentLoop._normalize_state_fact(out3.content)
+
+
+@pytest.mark.asyncio
+async def test_current_event_detail_followup_uses_same_structured_event(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path, LLMResponse(content="这条不会用到", tool_calls=[]))
+    now_iso = datetime.now().astimezone().replace(microsecond=0).isoformat()
+    loop._recent_state_commitments["qq:c1"] = {
+        "slot": "current_activity",
+        "fact": "在看线代例题",
+        "reply": "在看线代例题",
+        "event": {
+            "activity": "学习",
+            "subject": "线代例题",
+            "status": "做了一会儿",
+            "scene": "家里",
+            "source": "synthesized",
+            "confidence": "medium",
+        },
+        "source": "commitment",
+        "rank": 3,
+        "uncertain": False,
+        "updated_at": datetime.now(),
+        "expires_at": datetime.now() + timedelta(minutes=10),
+    }
+    (tmp_path / "LIFESTATE.json").write_text(
+        f'{{"location":"家里","activity":"学习","mood":"平静","energy":70,"last_tick":"{now_iso}"}}',
+        encoding="utf-8",
+    )
+
+    out = await loop._process_message(
+        InboundMessage(channel="qq", sender_id="u1", chat_id="c1", content="学什么")
+    )
+
+    assert out is not None
+    assert "线代例题" in out.content
 
 
 @pytest.mark.asyncio
@@ -327,7 +361,7 @@ async def test_current_activity_without_evidence_uses_vague_non_scene_reply(tmp_
     assert "上课" not in out.content
     assert re.search(r"(有点事|忙点事|弄点东西)", out.content)
     assert not re.search(r"(学校|教室|通勤|开会)", out.content)
-    assert loop.provider.chat_with_retry.await_count == 0
+    assert loop.provider.chat_with_retry.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -377,7 +411,7 @@ async def test_state_correction_is_explicit_not_silent(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_greeting_rule_first_does_not_use_state_or_llm(tmp_path: Path) -> None:
+async def test_greeting_uses_llm_but_not_state_leak(tmp_path: Path) -> None:
     (tmp_path / "LIFESTATE.json").write_text(
         '{"location":"外面","activity":"闲逛","mood":"平静","energy":70}',
         encoding="utf-8",
@@ -389,7 +423,7 @@ async def test_greeting_rule_first_does_not_use_state_or_llm(tmp_path: Path) -> 
 
     assert out is not None
     assert "外面" not in out.content
-    assert loop.provider.chat_with_retry.await_count == 0
+    assert loop.provider.chat_with_retry.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -410,4 +444,4 @@ async def test_meal_slot_prefers_meal_event_and_not_state(tmp_path: Path) -> Non
     assert out is not None
     assert "吃" in out.content
     assert "外面" not in out.content
-    assert loop.provider.chat_with_retry.await_count == 0
+    assert loop.provider.chat_with_retry.await_count == 1

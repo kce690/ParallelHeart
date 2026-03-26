@@ -1,6 +1,7 @@
 """Cron tool for scheduling reminders and tasks."""
 
 from contextvars import ContextVar
+from datetime import datetime
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
@@ -120,8 +121,6 @@ class CronTool(Tool):
         elif cron_expr:
             schedule = CronSchedule(kind="cron", expr=cron_expr, tz=tz)
         elif at:
-            from datetime import datetime
-
             try:
                 dt = datetime.fromisoformat(at)
             except ValueError:

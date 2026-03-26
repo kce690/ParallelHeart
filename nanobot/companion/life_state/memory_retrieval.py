@@ -13,6 +13,7 @@ from nanobot.companion.life_state.memory_utils import parse_iso, tokenize
 
 _TRACE_MIN_SIGNAL = 0.06
 _PROFILE_WINDOWS_HOURS: dict[str, dict[str, float | None]] = {
+    "generated_detail": {"detail": 8.0, "gist": 36.0, "trace": 120.0},
     "meal": {"detail": 24.0, "gist": 72.0, "trace": 336.0},
     "study": {"detail": 48.0, "gist": 168.0, "trace": 720.0},
     "relationship": {"detail": 168.0, "gist": 720.0, "trace": None},
@@ -66,6 +67,9 @@ def retrieve_memories(
             permanence_tier=entry.permanence_tier,
             pinned_flag=entry.pinned_flag,
             coarse_type=_coarse_type(entry),
+            source_kind=str(entry.source_kind or ""),
+            memory_type=str(entry.memory_type or "life_event"),
+            source_confidence=float(entry.source_confidence or 0.0),
         )
         out.append((score, evidence))
 
@@ -119,6 +123,9 @@ def _within(age_hours: float | None, limit_hours: float | None) -> bool:
 
 
 def _decay_profile(entry: MemoryEntry) -> str:
+    source_kind = str(entry.source_kind or "").strip().lower()
+    if source_kind == "generated_detail":
+        return "generated_detail"
     coarse = _coarse_type(entry)
     if coarse in {"meal", "study", "relationship"}:
         return coarse
@@ -142,7 +149,7 @@ def _decay_profile(entry: MemoryEntry) -> str:
 
 def _coarse_type(entry: MemoryEntry) -> str:
     explicit = str(entry.coarse_type or "").strip().lower()
-    if explicit in {"meal", "study", "relationship", "default"}:
+    if explicit in {"meal", "study", "relationship", "activity", "availability", "previous_activity", "default"}:
         return explicit
     return "default"
 
@@ -150,6 +157,14 @@ def _coarse_type(entry: MemoryEntry) -> str:
 def _coarse_gist_text(entry: MemoryEntry) -> str:
     coarse = _coarse_type(entry)
     profile = _decay_profile(entry)
+    if profile == "generated_detail":
+        if coarse == "meal":
+            return "Had some meal-related detail in that period."
+        if coarse == "availability":
+            return "Had a busy/availability state in that period."
+        if coarse in {"activity", "previous_activity"}:
+            return "Was occupied with some activity in that period."
+        return "Had a short-lived generated life detail in that period."
     if coarse == "meal" or profile == "meal":
         return "Had a meal in that period."
     if coarse == "study" or profile == "study":
@@ -174,6 +189,14 @@ def _trace_text(entry: MemoryEntry) -> str:
         return explicit
     profile = _decay_profile(entry)
     coarse = _coarse_type(entry)
+    if profile == "generated_detail":
+        if coarse == "meal":
+            return "Seemed to have had something to eat around that time."
+        if coarse == "availability":
+            return "Seemed to be in some busy/free state around that time."
+        if coarse in {"activity", "previous_activity"}:
+            return "Seemed to have been doing something around that time."
+        return "There was a vague generated life detail around that time."
     if coarse == "meal" or profile == "meal":
         return "Had a meal around that time."
     if coarse == "study" or profile == "study":

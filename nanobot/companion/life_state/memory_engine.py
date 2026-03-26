@@ -7,6 +7,7 @@ import re
 from datetime import datetime
 from typing import Any
 
+from loguru import logger
 from nanobot.companion.life_state.memory_config import MemoryForgettingConfig
 from nanobot.companion.life_state.memory_decay import decay_entry, reinforce_entry
 from nanobot.companion.life_state.memory_interference import (
@@ -17,7 +18,7 @@ from nanobot.companion.life_state.memory_models import MemoryEntry, MemoryEviden
 from nanobot.companion.life_state.memory_retrieval import retrieve_memories
 from nanobot.companion.life_state.memory_scoring import score_event
 from nanobot.companion.life_state.memory_store import LifeMemoryStore
-from nanobot.companion.life_state.memory_utils import now_local, parse_iso, to_iso
+from nanobot.companion.life_state.memory_utils import now_local, parse_iso, to_iso, tokenize
 
 
 class LifeMemoryEngine:
@@ -75,6 +76,9 @@ class LifeMemoryEngine:
                 decay_profile=decay_profile,
                 coarse_type=coarse_type,
             )
+            decay_overrides = raw.get("decay_overrides")
+            if not isinstance(decay_overrides, dict):
+                decay_overrides = {}
 
             event_id = str(raw.get("event_id") or raw.get("id") or "")
             entry = MemoryEntry(
@@ -113,7 +117,9 @@ class LifeMemoryEngine:
                 last_recalled_at=None,
                 last_accessed_time=None,
                 last_decay_at=to_iso(event_time),
+                decay_overrides={str(k): float(v) for k, v in decay_overrides.items() if isinstance(v, (int, float))},
             )
+            self._apply_generated_detail_entry_policy(entry)
             entries.append(entry)
             recompute_cluster_pressure(entries, now=event_time, cfg=self.config)
             self._save_entries(entries)
@@ -186,6 +192,74 @@ class LifeMemoryEngine:
                 self._save_entries(entries)
             return reinforced
 
+    def downgrade_generated_details_by_fact(
+        self,
+        *,
+        fact_content: str,
+        fact_start_at: datetime,
+        coarse_type: str = "activity",
+        max_age_hours: float = 8.0,
+    ) -> int:
+        """Down-rank conflicting generated-detail memories when stronger fact arrives."""
+        content = str(fact_content or "").strip()
+        if not content:
+            return 0
+        fact_tokens = set(tokenize(content))
+        if not fact_tokens:
+            return 0
+        target_coarse = str(coarse_type or "default").strip().lower()
+        if target_coarse not in {
+            "meal", "study", "relationship", "activity", "availability", "previous_activity", "default",
+        }:
+            target_coarse = "default"
+
+        with self._lock:
+            entries = self._load_entries()
+            changed = 0
+            for entry in entries:
+                if str(entry.source_kind or "").strip().lower() != "generated_detail":
+                    continue
+                stamp = (
+                    parse_iso(entry.event_time_start)
+                    or parse_iso(entry.timestamp_last)
+                    or parse_iso(entry.stored_time)
+                )
+                if stamp is not None:
+                    age_hours = abs((fact_start_at - stamp).total_seconds()) / 3600.0
+                    if age_hours > max(0.5, float(max_age_hours)):
+                        continue
+                entry_coarse = str(entry.coarse_type or "default").strip().lower() or "default"
+                if target_coarse != "default" and entry_coarse not in {target_coarse, "default"}:
+                    continue
+                detail_tokens = set(tokenize(f"{entry.detail_text} {entry.gist_summary}"))
+                if not detail_tokens:
+                    continue
+                overlap = len(fact_tokens & detail_tokens) / max(1.0, float(len(fact_tokens | detail_tokens)))
+                if overlap >= 0.32:
+                    continue
+                entry.detail_strength = min(entry.detail_strength, 0.08)
+                entry.gist_strength = min(entry.gist_strength, 0.12)
+                entry.source_confidence = min(entry.source_confidence, 0.28)
+                entry.decay_overrides["lambda_detail"] = max(
+                    float(entry.decay_overrides.get("lambda_detail", self.config.decay.lambda_detail)),
+                    self.config.decay.lambda_detail * 3.2,
+                )
+                entry.decay_overrides["lambda_gist"] = max(
+                    float(entry.decay_overrides.get("lambda_gist", self.config.decay.lambda_gist)),
+                    self.config.decay.lambda_gist * 2.4,
+                )
+                changed += 1
+            if changed:
+                recompute_cluster_pressure(entries, now=fact_start_at, cfg=self.config)
+                self._save_entries(entries)
+                logger.info(
+                    "life-memory generated_detail downgraded by hard fact count={} coarse_type={} fact={}",
+                    changed,
+                    target_coarse,
+                    content[:80],
+                )
+            return changed
+
     def rebuild_from_raw_events(self) -> int:
         """Rebuild memory index deterministically from immutable raw event log."""
         with self._lock:
@@ -227,46 +301,50 @@ class LifeMemoryEngine:
                     decay_profile=decay_profile,
                     coarse_type=coarse_type,
                 )
+                decay_overrides = raw.get("decay_overrides")
+                if not isinstance(decay_overrides, dict):
+                    decay_overrides = {}
                 event_id = str(raw.get("event_id") or raw.get("id") or "")
-                entries.append(
-                    MemoryEntry(
-                        id=f"mem_{event_id}",
-                        event_ids=[event_id] if event_id else [],
-                        timestamp_first=to_iso(event_time),
-                        timestamp_last=to_iso(event_time),
-                        event_time_start=event_time_start,
-                        event_time_end=event_time_end,
-                        mentioned_time=mentioned_time,
-                        stored_time=stored_time,
-                        source_turn=source_turn,
-                        source_kind=source_kind,
-                        memory_type=scored["memory_type"],
-                        gist_summary=scored["gist_summary"],
-                        detail_text=scored["detail_text"],
-                        trace_summary=trace_summary,
-                        importance=scored["importance"],
-                        salience=scored["salience"],
-                        self_relevance=scored["self_relevance"],
-                        relationship_relevance=scored["relationship_relevance"],
-                        emotional_weight=scored["emotional_weight"],
-                        novelty=scored["novelty"],
-                        source_confidence=scored["source_confidence"],
-                        retrieval_count=0,
-                        similarity_cluster_id=scored["similarity_cluster_id"],
-                        similarity_cluster_pressure=scored["similarity_cluster_pressure"],
-                        pinned_flag=scored["pinned_flag"],
-                        permanence_tier=scored["permanence_tier"],
-                        decay_profile=decay_profile,
-                        coarse_type=coarse_type,
-                        detail_strength=scored["detail_strength"],
-                        gist_strength=scored["gist_strength"],
-                        detail_strength_base=scored["detail_strength_base"],
-                        gist_strength_base=scored["gist_strength_base"],
-                        last_recalled_at=None,
-                        last_accessed_time=None,
-                        last_decay_at=to_iso(event_time),
-                    )
+                entry = MemoryEntry(
+                    id=f"mem_{event_id}",
+                    event_ids=[event_id] if event_id else [],
+                    timestamp_first=to_iso(event_time),
+                    timestamp_last=to_iso(event_time),
+                    event_time_start=event_time_start,
+                    event_time_end=event_time_end,
+                    mentioned_time=mentioned_time,
+                    stored_time=stored_time,
+                    source_turn=source_turn,
+                    source_kind=source_kind,
+                    memory_type=scored["memory_type"],
+                    gist_summary=scored["gist_summary"],
+                    detail_text=scored["detail_text"],
+                    trace_summary=trace_summary,
+                    importance=scored["importance"],
+                    salience=scored["salience"],
+                    self_relevance=scored["self_relevance"],
+                    relationship_relevance=scored["relationship_relevance"],
+                    emotional_weight=scored["emotional_weight"],
+                    novelty=scored["novelty"],
+                    source_confidence=scored["source_confidence"],
+                    retrieval_count=0,
+                    similarity_cluster_id=scored["similarity_cluster_id"],
+                    similarity_cluster_pressure=scored["similarity_cluster_pressure"],
+                    pinned_flag=scored["pinned_flag"],
+                    permanence_tier=scored["permanence_tier"],
+                    decay_profile=decay_profile,
+                    coarse_type=coarse_type,
+                    detail_strength=scored["detail_strength"],
+                    gist_strength=scored["gist_strength"],
+                    detail_strength_base=scored["detail_strength_base"],
+                    gist_strength_base=scored["gist_strength_base"],
+                    last_recalled_at=None,
+                    last_accessed_time=None,
+                    last_decay_at=to_iso(event_time),
+                    decay_overrides={str(k): float(v) for k, v in decay_overrides.items() if isinstance(v, (int, float))},
                 )
+                self._apply_generated_detail_entry_policy(entry)
+                entries.append(entry)
                 recompute_cluster_pressure(entries, now=event_time, cfg=self.config)
 
             self._save_entries(entries)
@@ -291,19 +369,20 @@ class LifeMemoryEngine:
             "- GIST evidence is coarse only; do not invent missing details.",
             "- TRACE evidence is very coarse only; do not restore specifics.",
             "- If no evidence is strong enough, say memory is unclear.",
+            "- GENERATED_DETAIL evidence is model-generated soft memory, never stronger than hard facts.",
         ]
         if detail:
             lines.append("DETAIL evidence:")
             for item in detail[:4]:
-                lines.append(f"- [{item.id}] {item.text}")
+                lines.append(f"- [{item.id}|{item.source_kind or 'memory'}] {item.text}")
         if gist:
             lines.append("GIST_ONLY evidence:")
             for item in gist[:4]:
-                lines.append(f"- [{item.id}] {item.gist_summary}")
+                lines.append(f"- [{item.id}|{item.source_kind or 'memory'}] {item.gist_summary}")
         if trace:
             lines.append("TRACE_ONLY evidence:")
             for item in trace[:4]:
-                lines.append(f"- [{item.id}] {item.text}")
+                lines.append(f"- [{item.id}|{item.source_kind or 'memory'}] {item.text}")
         if not detail and not gist and not trace:
             lines.append("No reliable long-term memory evidence for this query.")
 
@@ -322,9 +401,13 @@ class LifeMemoryEngine:
         pinned_flag: bool,
     ) -> str:
         explicit = str(raw.get("decay_profile") or "").strip().lower()
-        valid = {"meal", "study", "relationship", "anchor", "default"}
+        valid = {"meal", "study", "relationship", "activity", "availability", "previous_activity", "generated_detail", "anchor", "default"}
         if explicit in valid:
             return explicit
+        if str(scored_memory_type or "").strip().lower().startswith("generated_detail"):
+            return "generated_detail"
+        if str(raw.get("source_kind") or "").strip().lower() == "generated_detail":
+            return "generated_detail"
         if pinned_flag:
             return "anchor"
 
@@ -345,7 +428,7 @@ class LifeMemoryEngine:
 
     @staticmethod
     def _resolve_coarse_type(*, raw: dict[str, Any], decay_profile: str) -> str:
-        valid = {"meal", "study", "relationship", "default"}
+        valid = {"meal", "study", "relationship", "activity", "availability", "previous_activity", "default"}
         explicit = str(raw.get("coarse_type") or raw.get("recalled_kind") or "").strip().lower()
         if explicit in valid:
             return explicit
@@ -354,7 +437,11 @@ class LifeMemoryEngine:
             suffix = event_type.removeprefix("recalled_")
             if suffix in valid:
                 return suffix
-        if decay_profile in {"meal", "study", "relationship"}:
+        if event_type.startswith("generated_detail_"):
+            suffix = event_type.removeprefix("generated_detail_")
+            if suffix in valid:
+                return suffix
+        if decay_profile in {"meal", "study", "relationship", "activity", "availability", "previous_activity"}:
             return decay_profile
         return "default"
 
@@ -366,6 +453,14 @@ class LifeMemoryEngine:
             return "Spent time on study-related activities."
         if coarse_type == "relationship":
             return "Had a relationship-relevant interaction."
+        if coarse_type == "activity":
+            return "Was doing something around that time."
+        if coarse_type == "availability":
+            return "Had some busy/free state around that time."
+        if coarse_type == "previous_activity":
+            return "Had some earlier activity around that time."
+        if decay_profile == "generated_detail":
+            return "There was a short-lived generated life detail around that time."
         if decay_profile == "meal":
             return "Had a meal around that time."
         if decay_profile == "study":
@@ -376,6 +471,33 @@ class LifeMemoryEngine:
             return "A long-term core milestone was involved."
         return "A past event happened in that period."
 
+    def _apply_generated_detail_entry_policy(self, entry: MemoryEntry) -> None:
+        """Keep generated-detail memories weak, volatile, and fast-forgetting."""
+        if str(entry.source_kind or "").strip().lower() != "generated_detail":
+            return
+        entry.decay_profile = "generated_detail"
+        entry.pinned_flag = False
+        entry.permanence_tier = "volatile"
+        entry.source_confidence = min(float(entry.source_confidence or 0.45), 0.45)
+        entry.detail_strength = min(float(entry.detail_strength or 0.0), 0.58)
+        entry.gist_strength = min(float(entry.gist_strength or 0.0), 0.52)
+        entry.detail_strength_base = min(
+            float(entry.detail_strength_base or entry.detail_strength),
+            entry.detail_strength,
+        )
+        entry.gist_strength_base = min(
+            float(entry.gist_strength_base or entry.gist_strength),
+            entry.gist_strength,
+        )
+        entry.decay_overrides["lambda_detail"] = max(
+            float(entry.decay_overrides.get("lambda_detail", self.config.decay.lambda_detail)),
+            self.config.decay.lambda_detail * 2.6,
+        )
+        entry.decay_overrides["lambda_gist"] = max(
+            float(entry.decay_overrides.get("lambda_gist", self.config.decay.lambda_gist)),
+            self.config.decay.lambda_gist * 2.1,
+        )
+
     def _load_entries(self) -> list[MemoryEntry]:
         payload = self.store.load_memory_index()
         entries_raw = payload.get("entries") or []
@@ -384,6 +506,7 @@ class LifeMemoryEngine:
             if isinstance(item, dict):
                 entry = MemoryEntry.from_dict(item)
                 if entry.id:
+                    self._apply_generated_detail_entry_policy(entry)
                     out.append(entry)
         return out
 
